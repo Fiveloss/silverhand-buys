@@ -27,7 +27,7 @@
 their group or channel, and it posts every buy of their token the moment it lands
 on-chain: on the bonding curve and, after graduation, on Uniswap v4.
 
-<img src="assets/brand/post-example.png" alt="An example buy post" width="400" align="right">
+<img src="assets/brand/post-card.gif" alt="An animated buy post" width="440" align="right">
 
 - 💵 **Every buy, live**: amount paid, tokens received, the wallet (🆕 new holder or
   its position change), with dev buys and 🐋 whales marked; sells too if you want
