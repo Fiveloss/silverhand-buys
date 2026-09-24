@@ -1,0 +1,31 @@
+name: Bug report
+description: Something the bot posted or did is wrong
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Never paste a private key, seed phrase or bot token here.
+        Security problems go to **Security → Report a vulnerability**, not to an issue.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, what the bot did instead.
+    validations:
+      required: true
+  - type: input
+    id: token
+    attributes:
+      label: Token address
+      placeholder: 0x…
+  - type: input
+    id: tx
+    attributes:
+      label: Transaction hash (for a wrong or missing post)
+      placeholder: 0x…
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or preflight output (self-hosted)
+      render: text

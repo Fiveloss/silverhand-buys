@@ -1,0 +1,3 @@
+# LF line endings everywhere, also in archives made on Windows (git archive
+# applies core.autocrlf): the shell scripts run on Linux and break on CRLF.
+* text=auto eol=lf

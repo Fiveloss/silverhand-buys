@@ -1,0 +1,14 @@
+name: Feature request
+description: An idea for the bot, or another launchpad to support
+labels: [enhancement]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Who it helps and how
