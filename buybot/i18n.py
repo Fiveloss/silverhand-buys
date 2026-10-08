@@ -9,8 +9,9 @@ LANG_NAMES = {"en": "🇬🇧 English", "ru": "🇷🇺 Русский"}
 
 
 def guess(code: str | None) -> str:
-    """A first guess from Telegram's language_code, before the person picks."""
-    return "ru" if code and code.split("-")[0].lower() in ("ru", "uk", "be", "kk") else "en"
+    """The language before the person picks: English, whatever Telegram's language_code
+    says. The first /start asks anyway, with English first."""
+    return "en"
 
 
 def norm(lang: str | None) -> str:

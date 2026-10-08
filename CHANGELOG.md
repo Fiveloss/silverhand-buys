@@ -2,7 +2,7 @@
 
 ## 0.2.0
 
-- The bot sets its description and about text itself, in English and Russian
+- The bot sets its description and about text itself, in each of its languages
   (`buybot/profile.py`).
 - Animated description picture for @BotFather, made by `tools/make_intro.py`.
 - Channels: commands posted in the channel work (answered silently, then removed),
@@ -16,8 +16,8 @@
   (the last 6 hours are loaded when a token is tracked); `/chart off` for text only.
 - A new post layout: dollars first, the numbers in a quote block; v4 trades name
   the wallet that sent the transaction.
-- English and Russian everywhere: the first `/start` asks, `/lang` changes it; `/lang`
-  in a chat sets the language of its posts. Command menus in both languages.
+- Languages everywhere: the first `/start` asks, `/lang` changes it; `/lang`
+  in a chat sets the language of its posts. Command menus in each language.
 - The private chat is a menu with an animated screen per section; **My chats**
   (`/chats`) lists where you added the bot, with buttons to manage each chat.
 - `/stats`: the token's last 24 h (buys, sells, volume, market cap range, biggest buy)

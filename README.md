@@ -8,8 +8,6 @@
   <a href="#self-hosting">Self-host</a>
   ·
   <a href="#how-it-works">How it works</a>
-  ·
-  <a href="README.ru.md">Русский</a>
 </p>
 
 <p align="center">
@@ -39,7 +37,7 @@ on-chain: on the bonding curve and, after graduation, on Uniswap v4.
 - 📈 **Stats in the chat**: `/stats` for the day, `/top` for the biggest buyers, and
   a 📊 24h button under each post that answers only whoever taps it
 - 🧹 **No spam**: at most one post per chat every 3 seconds; bursts are merged
-- 🌐 **English and Russian**, per person and per chat; groups with topics work
+- 🌐 **Your language**, per person and per chat; groups with topics work
 - ⭐ **Pro**: no ad line and your own GIF, photo or video on every buy
 - 🔒 **Privacy mode on**: the bot only reads its own commands, never your chat
 - 🆓 **Free forever**, with one small ad line under each post
@@ -63,7 +61,7 @@ silently and removes the command and its answer a minute later. Every command
 gets a confirmation.
 
 **The private chat** is a menu with an animated screen per section. On the first
-`/start` the bot asks for English or Russian (`/lang` changes it). **My chats**
+`/start` the bot asks for your language (`/lang` changes it). **My chats**
 (`/chats`) lists every group and channel you added the bot to, with buttons for a
 test post, stats, sells, the chart, the posts' language and Pro.
 
@@ -78,7 +76,7 @@ test post, stats, sells, the chart, the posts' language and Pro.
 | `/chart on` · `still` · `off` | the market-cap candle chart with each post: animated (the default), a still picture, or none |
 | `/stats` | the last 24 h: buys, sells, volume, market cap high and low, biggest buy, posts here |
 | `/top` | the wallets that bought the most in the last 24 h |
-| `/lang ru` · `/lang en` | the language of posts and answers in this chat |
+| `/lang en` | the language of posts and answers in this chat |
 | `/media` | reply to a GIF, photo or video to show it on every buy (Pro) |
 | `/settings` · `/pro` · `/untrack` · `/help` | settings, Pro, stop, help |
 
