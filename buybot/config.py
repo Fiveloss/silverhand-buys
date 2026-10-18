@@ -1,7 +1,7 @@
 """Settings from the environment, optionally loaded from a .env file next to the code."""
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -25,16 +25,6 @@ def _ids(value: str) -> frozenset[int]:
     return frozenset(int(x) for x in value.replace(" ", "").split(",") if x)
 
 
-def _plans(value: str) -> dict[int, int]:
-    """"1:500,4:1500" -> {1: 500, 4: 1500} (weeks: stars)."""
-    out = {}
-    for part in value.replace(" ", "").split(","):
-        if part:
-            weeks, stars = part.split(":")
-            out[int(weeks)] = int(stars)
-    return out
-
-
 @dataclass(frozen=True)
 class Config:
     bot_token: str
@@ -45,12 +35,18 @@ class Config:
     rpc_min_interval: float = 0.3
     explorer_url: str = "https://robinhoodchain.blockscout.com"
     trade_url: str = "https://gmgn.ai/robinhood/token/{token}"
-    pro_plans: dict[int, int] = field(default_factory=lambda: {1: 500, 4: 1500})
-    ad_day_stars: int = 750
-    ad_max_days: int = 7
     support_contact: str = ""
     source_url: str = ""
     log_level: str = "INFO"
+
+
+# The free public RPC sits behind Cloudflare, which shuts out an IP that asks too often:
+# with it, the watcher looks for new blocks at most this often (a tick is one batch).
+PUBLIC_POLL_FLOOR = 5.0
+
+
+def poll_seconds(rpc_url: str, wanted: float) -> float:
+    return max(wanted, PUBLIC_POLL_FLOOR) if rpc_url.rstrip("/") == Config.rpc_url else wanted
 
 
 def load_config(env_file: str | Path = ".env") -> Config:
@@ -59,18 +55,16 @@ def load_config(env_file: str | Path = ".env") -> Config:
     if not token:
         raise SystemExit("BOT_TOKEN is not set (see .env.example)")
     e = os.environ.get
+    rpc_url = e("RPC_URL", Config.rpc_url)
     return Config(
         bot_token=token,
         owner_ids=_ids(e("OWNER_IDS", "")),
-        rpc_url=e("RPC_URL", Config.rpc_url),
+        rpc_url=rpc_url,
         db_path=e("DB_PATH", Config.db_path),
-        poll_seconds=float(e("POLL_SECONDS", Config.poll_seconds)),
+        poll_seconds=poll_seconds(rpc_url, float(e("POLL_SECONDS", Config.poll_seconds))),
         rpc_min_interval=float(e("RPC_MIN_INTERVAL", Config.rpc_min_interval)),
         explorer_url=e("EXPLORER_URL", Config.explorer_url).rstrip("/"),
         trade_url=e("TRADE_URL", Config.trade_url),
-        pro_plans=_plans(e("PRO_PLANS", "1:500,4:1500")),
-        ad_day_stars=int(e("AD_DAY_STARS", Config.ad_day_stars)),
-        ad_max_days=int(e("AD_MAX_DAYS", Config.ad_max_days)),
         support_contact=e("SUPPORT_CONTACT", ""),
         source_url=e("SOURCE_URL", ""),
         log_level=e("LOG_LEVEL", "INFO"),

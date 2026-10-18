@@ -20,8 +20,8 @@ Thanks for helping! Bug reports, fixes and support for more launchpads are all w
   or seed phrases.
 - **Be polite to the public RPC.** No per-trade calls. New reads go through
   `rpc.Rpc` and are budgeted per tick, not per event.
-- **Telegram rules:** digital goods are sold for Telegram Stars only. Settings
-  commands stay admin-only.
+- **No ads, nothing for sale.** If a paid feature is ever added, Telegram requires
+  Stars, `/terms` and `/paysupport` with it. Settings commands stay admin-only.
 - Match the style of the code around you: small pure functions where possible,
   comments that say *why*.
 

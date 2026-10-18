@@ -9,7 +9,7 @@ as we can and credit you in the fix unless you prefer otherwise.
 Things we especially want to hear about:
 
 - a way to make the bot post someone else's text, links or prices in a chat;
-- a way to change a chat's settings, or claim a paid plan, without being an admin or paying;
+- a way to change a chat's settings without being an admin;
 - anything that makes the bot show a wrong amount, buyer or market cap for a real trade.
 
 ## What the bot will never do

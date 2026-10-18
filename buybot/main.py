@@ -18,9 +18,10 @@ from .config import load_config
 from .db import Db
 from .prices import EthUsd
 from .profile import sync_profile
+from .quotes import QUOTES, Rates
 from .rpc import Rpc
 from .sender import Sender
-from .watcher import Watcher
+from .watcher import HEAD_LAG, Watcher
 
 log = logging.getLogger("buybot")
 
@@ -31,14 +32,14 @@ GROUP_COMMANDS = [
     ("settings", "Current settings", "Текущие настройки"),
     ("stats", "Buys, sells and volume of 24 h", "Покупки, продажи и объём за 24 ч"),
     ("top", "The biggest buyers of 24 h", "Крупнейшие покупатели за 24 ч"),
+    ("scan", "Holders, snipers, dev, ticker: /scan 0x…", "Держатели, снайперы, дев, тикер: /scan 0x…"),
     ("sells", "Post sells too: on/off", "Публиковать и продажи: on/off"),
     ("chart", "Price chart on posts: on/off", "График в постах: on/off"),
     ("lang", "Language of posts: en/ru", "Язык постов: en/ru"),
     ("minbuy", "Skip buys under $N", "Не публиковать покупки меньше $N"),
     ("emoji", "The mark of a buy", "Значок покупки"),
     ("whale", "The 🐋 mark from $N", "Метка 🐋 от $N"),
-    ("media", "GIF/photo/video on buys (Pro)", "Гифка/фото/видео в постах (Pro)"),
-    ("pro", "Pro for this chat", "Pro для этого чата"),
+    ("media", "Your GIF/photo/video on buys", "Своя гифка/фото/видео в постах"),
     ("untrack", "Stop posting", "Перестать публиковать"),
     ("help", "All commands", "Все команды"),
 ]
@@ -46,11 +47,11 @@ PRIVATE_COMMANDS = [
     ("start", "Menu", "Меню"),
     ("chats", "My groups and channels", "Мои группы и каналы"),
     ("stats", "Stats of the current chat", "Статистика текущего чата"),
+    ("scan", "Check a token: /scan 0x…", "Проверить токен: /scan 0x…"),
     ("lang", "Language / Язык", "Язык / Language"),
     ("help", "Commands", "Команды"),
-    ("advertise", "Advertise under buys", "Реклама под покупками"),
     ("terms", "Terms", "Условия"),
-    ("paysupport", "Help with a payment", "Помощь с оплатой"),
+    ("support", "Questions and problems", "Вопросы и проблемы"),
 ]
 
 
@@ -108,15 +109,18 @@ async def main() -> None:
     async with aiohttp.ClientSession(trust_env=True) as session:
         rpc = Rpc(cfg.rpc_url, session, min_interval=cfg.rpc_min_interval)
         eth_usd = EthUsd(session)
+        rates = Rates(rpc, eth_usd)
+        repriced = db.reprice_quotes(QUOTES)
+        if repriced:
+            log.info("%d tokens and pools now have a dollar rate", repriced)
         bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML,
                                                               link_preview_is_disabled=True))
         me = await bot.get_me()
         log.info("starting as @%s", me.username)
 
-        app = App(cfg=cfg, db=db, rpc=rpc, eth_usd=eth_usd, username=me.username)
-        app.watcher = Watcher(rpc, db, eth_usd, poll_seconds=cfg.poll_seconds)
-        app.sender = Sender(bot, db, me.username, trade_url=cfg.trade_url,
-                            explorer=cfg.explorer_url)
+        app = App(cfg=cfg, db=db, rpc=rpc, eth_usd=eth_usd, username=me.username, rates=rates)
+        app.watcher = Watcher(rpc, db, eth_usd, rates=rates, poll_seconds=cfg.poll_seconds, head_lag=HEAD_LAG)
+        app.sender = Sender(bot, db, trade_url=cfg.trade_url, explorer=cfg.explorer_url)
 
         dp = Dispatcher()
         dp.include_router(build_router(app))
@@ -137,6 +141,7 @@ async def main() -> None:
 
         tasks = [asyncio.create_task(app.watcher.run(), name="watcher"),
                  asyncio.create_task(app.watcher.backfill_missing(), name="backfill"),
+                 asyncio.create_task(app.watcher.pool_refresher(), name="pools"),
                  asyncio.create_task(app.sender.run(), name="sender"),
                  asyncio.create_task(watchdog(bot, app), name="watchdog"),
                  asyncio.create_task(backups(app, str(Path(cfg.db_path).parent / "backups")),

@@ -52,10 +52,8 @@ MENU = {
         "chats":   ("MY CHATS", "GROUPS · CHANNELS · SETTINGS"),
         "stats":   ("STATISTICS", "BUYS · SELLS · VOLUME · 24H"),
         "help":    ("HOW IT WORKS", "TRACK · TEST · SETTINGS"),
-        "pro":     ("PRO", "NO AD LINE · YOUR OWN GIF"),
-        "ads":     ("ADVERTISE", "YOUR LINE UNDER EVERY BUY"),
-        "terms":   ("TERMS", "STARS · REFUNDS · RULES"),
-        "support": ("SUPPORT", "PAYMENTS · REFUNDS"),
+        "terms":   ("TERMS", "NO ADS · SOURCE · NFA"),
+        "support": ("SUPPORT", "QUESTIONS · PROBLEMS"),
         "lang":    ("LANGUAGE", "ENGLISH · РУССКИЙ"),
     },
     "ru": {
@@ -63,10 +61,8 @@ MENU = {
         "chats":   ("МОИ ЧАТЫ", "ГРУППЫ · КАНАЛЫ · НАСТРОЙКИ"),
         "stats":   ("СТАТИСТИКА", "ПОКУПКИ · ПРОДАЖИ · ОБЪЁМ · 24Ч"),
         "help":    ("КАК ЭТО РАБОТАЕТ", "TRACK · TEST · НАСТРОЙКИ"),
-        "pro":     ("PRO", "БЕЗ РЕКЛАМЫ · СВОЯ ГИФКА"),
-        "ads":     ("РЕКЛАМА", "ВАША СТРОКА ПОД КАЖДОЙ ПОКУПКОЙ"),
-        "terms":   ("УСЛОВИЯ", "STARS · ВОЗВРАТЫ · ПРАВИЛА"),
-        "support": ("ПОДДЕРЖКА", "ОПЛАТА · ВОЗВРАТЫ"),
+        "terms":   ("УСЛОВИЯ", "БЕЗ РЕКЛАМЫ · ИСХОДНИКИ · NFA"),
+        "support": ("ПОДДЕРЖКА", "ВОПРОСЫ · ПРОБЛЕМЫ"),
     },
 }
 MENU_EYEBROW = {"en": "// BUY BOT", "ru": "// БОТ ПОКУПОК"}

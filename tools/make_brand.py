@@ -2,8 +2,8 @@
 
     python3 tools/make_brand.py
 
-Needs a headless Chromium (set CHROME if it lives elsewhere) and the Noto Color
-Emoji font. The example post is produced by the bot's own renderer, so the
+Needs Chromium or Chrome (set CHROME to its path; a full Chrome runs headless) and
+an emoji font. Text is set in the bundled Instrument Sans (assets/fonts, OFL). The example post is produced by the bot's own renderer, so the
 picture shows exactly what the bot sends.
 """
 
@@ -20,7 +20,9 @@ from buybot.db import Chat  # noqa: E402
 
 BRAND = ROOT / "assets" / "brand"
 CHROME = os.environ.get("CHROME", "/opt/pw-browsers/chromium_headless_shell-1194/chrome-linux/headless_shell")
-FONT = "'DejaVu Sans', 'Noto Color Emoji', sans-serif"
+FONT = "'Instrument Sans', 'Noto Color Emoji', 'Segoe UI Emoji', sans-serif"
+FONT_FACE = """@font-face{font-family:'Instrument Sans';src:url('../fonts/InstrumentSans.ttf');
+font-weight:400 700;font-stretch:75% 100%}"""
 
 BG = """
 background:
@@ -39,16 +41,17 @@ background: linear-gradient(180deg, #ffffff 0%, #d4dbe3 42%, #7d8896 52%, #eef2f
 def shot(html: str, out: Path, w: int, h: int) -> None:
     page = BRAND / f".{out.stem}.html"
     page.write_text(html, encoding="utf-8")
-    subprocess.run([CHROME, "--no-sandbox", "--disable-gpu", "--hide-scrollbars",
-                    f"--screenshot={out}", f"--window-size={w},{h}", page.as_uri()],
-                   check=True, capture_output=True)
+    headless = [] if "headless_shell" in CHROME else ["--headless=new"]
+    subprocess.run([CHROME, *headless, "--no-sandbox", "--disable-gpu", "--hide-scrollbars",
+                    "--allow-file-access-from-files", f"--screenshot={out}", f"--window-size={w},{h}",
+                    page.as_uri()], check=True, capture_output=True)
     page.unlink()
     print("wrote", out.relative_to(ROOT))
 
 
 def example_post() -> tuple[str, list[tuple[str, str]]]:
     chat = Chat(chat_id=0, title="", token="", min_usd=0, emoji="🟢", step_usd=150,
-                media_kind=None, media_file_id=None, pro_until=0, active=True, created_at=0)
+                media_kind=None, media_file_id=None, active=True, created_at=0)
     main = {"token": "0x" + "5" * 40, "symbol": "HANDS", "name": "Silver Hands",
             "quote_symbol": "ETH", "quote": 0.42, "usd": 1260.0, "tokens": 11_800_000,
             "buyer": "0x3f927788d627d3561ff59bbfef67ebcbf0fb10a9", "dev": False,
@@ -57,7 +60,7 @@ def example_post() -> tuple[str, list[tuple[str, str]]]:
     more = [dict(main, quote=0.05, usd=150.0), dict(main, quote=0.12, usd=360.0),
             dict(main, quote=0.08, usd=240.0)]
     text = render.buy_text(main, chat, more, explorer="https://robinhoodchain.blockscout.com")
-    text += render.footer(False, None, "SilverhandBuysBot")
+    text += render.footer()
     return text, render.buttons(main, "https://gmgn.ai/robinhood/token/{token}", "https://x")
 
 
@@ -96,7 +99,7 @@ def main() -> None:
     if not avatar.exists():
         raise SystemExit(f"missing {avatar}")
 
-    shot(f"""<!doctype html><meta charset="utf-8"><style>
+    shot(f"""<!doctype html><meta charset="utf-8"><style>{FONT_FACE}
 body{{margin:0;width:1280px;height:640px;{BG}font-family:{FONT};color:#dfe6ec;overflow:hidden}}
 .ava{{position:absolute;left:92px;top:110px;width:420px;height:420px;border-radius:50%;
   box-shadow:0 0 0 3px rgba(45,245,154,.55),0 0 70px rgba(45,245,154,.45)}}
@@ -111,15 +114,15 @@ h1{{margin:0;font-size:84px;letter-spacing:-2px;line-height:1.05;{CHROME_TEXT}}}
 <div class="txt"><h1>Silverhand Buys</h1>
 <div class="tag">Live buy alerts for Robinhood Chain token chats</div>
 <div class="slogan">Not paper hands. Silver hands.</div>
-<div class="chips"><span class="chip">Free forever</span><span class="chip">Pons v2</span>
-<span class="chip">Uniswap v4</span><span class="chip">Telegram Stars</span></div></div>""",
+<div class="chips"><span class="chip">No ads</span><span class="chip">Pons · Flap.sh</span>
+<span class="chip">Uniswap v2/v3/v4</span><span class="chip">Open source</span></div></div>""",
          BRAND / "banner.png", 1280, 640)
 
-    shot(f"""<!doctype html><meta charset="utf-8"><style>
+    shot(f"""<!doctype html><meta charset="utf-8"><style>{FONT_FACE}
 body{{margin:0;padding:34px 40px;{BG}background-color:#0e1621}}{POST_CSS}</style>{post_html()}""",
          BRAND / "post-example.png", 600, 440)
 
-    shot(f"""<!doctype html><meta charset="utf-8"><style>
+    shot(f"""<!doctype html><meta charset="utf-8"><style>{FONT_FACE}
 body{{margin:0;width:640px;height:360px;{BG}font-family:{FONT};overflow:hidden}}
 .ava{{position:absolute;left:44px;top:70px;width:220px;height:220px;border-radius:50%;
   box-shadow:0 0 0 2px rgba(45,245,154,.55),0 0 44px rgba(45,245,154,.45)}}

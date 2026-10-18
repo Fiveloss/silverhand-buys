@@ -12,12 +12,19 @@ WorkingDirectory=__DIR__
 ExecStart=__DIR__/venv/bin/python -m buybot.main
 Restart=always
 RestartSec=5
+# Above MemoryHigh the kernel reclaims and slows the bot down instead of killing it; only
+# MemoryMax kills. The bot itself draws one card at a time (buybot/heavy.py).
+MemoryHigh=260M
 MemoryMax=300M
 CPUQuota=30%
 TasksMax=64
 Nice=10
 # Charts are drawn in worker threads; one malloc arena per thread made memory creep up.
 Environment=MALLOC_ARENA_MAX=2
+# A card's image buffers (MBs each) are mapped and unmapped, not kept in the heap: glibc
+# otherwise raises its mmap threshold after the first and holds the freed memory.
+Environment=MALLOC_MMAP_THRESHOLD_=131072
+Environment=MALLOC_TRIM_THRESHOLD_=131072
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full

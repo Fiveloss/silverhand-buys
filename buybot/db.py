@@ -6,9 +6,12 @@ transaction, so a restart neither loses nor repeats a buy. Big integers
 """
 
 import json
+import logging
 import sqlite3
 import time
 from dataclasses import dataclass
+
+log = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -32,7 +35,20 @@ CREATE TABLE IF NOT EXISTS tokens (
     curve_k TEXT,
     phantom TEXT,
     graduated INTEGER NOT NULL DEFAULT 0,
-    added_at INTEGER NOT NULL
+    added_at INTEGER NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'pons'   -- 'pons' (curve, then its v4 pool) | 'flap' (curve) | 'dex' (pools)
+);
+CREATE TABLE IF NOT EXISTS pools (
+    token TEXT NOT NULL,
+    venue TEXT NOT NULL,     -- v2 | v3 | v4
+    pool TEXT NOT NULL,      -- the pair or pool address, or the v4 PoolId
+    quote TEXT NOT NULL,
+    quote_symbol TEXT NOT NULL,
+    quote_decimals INTEGER NOT NULL,
+    quote_kind TEXT NOT NULL,
+    dex TEXT NOT NULL,
+    liquidity_usd REAL,
+    PRIMARY KEY (token, pool)
 );
 CREATE TABLE IF NOT EXISTS chats (
     chat_id INTEGER PRIMARY KEY,
@@ -43,7 +59,7 @@ CREATE TABLE IF NOT EXISTS chats (
     step_usd REAL NOT NULL DEFAULT 10,
     media_kind TEXT,
     media_file_id TEXT,
-    pro_until INTEGER NOT NULL DEFAULT 0,
+    pro_until INTEGER NOT NULL DEFAULT 0,   -- unused since 0.4 (no paid plan); older code still reads it
     active INTEGER NOT NULL DEFAULT 1,
     created_at INTEGER NOT NULL,
     sells INTEGER NOT NULL DEFAULT 0,
@@ -84,27 +100,6 @@ CREATE TABLE IF NOT EXISTS chat_stats (
     usd REAL NOT NULL DEFAULT 0,
     PRIMARY KEY (chat_id, day)
 );
-CREATE TABLE IF NOT EXISTS payments (
-    charge_id TEXT PRIMARY KEY,
-    user_id INTEGER NOT NULL,
-    amount INTEGER NOT NULL,
-    payload TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    refunded INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS ads (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    text TEXT NOT NULL,
-    url TEXT NOT NULL,
-    days INTEGER NOT NULL,
-    price INTEGER NOT NULL,
-    status TEXT NOT NULL,
-    starts_at INTEGER,
-    ends_at INTEGER,
-    charge_id TEXT,
-    created_at INTEGER NOT NULL
-);
 """
 
 CHAT_SETTINGS = {"title", "token", "min_usd", "emoji", "step_usd", "media_kind", "media_file_id",
@@ -118,7 +113,8 @@ MIGRATIONS = [("chats", "sells", "INTEGER NOT NULL DEFAULT 0"),
               ("chats", "kind", "TEXT"),
               ("chats", "thread_id", "INTEGER"),
               ("chats", "whale_usd", "REAL NOT NULL DEFAULT 1000"),
-              ("trades", "wallet", "TEXT")]
+              ("trades", "wallet", "TEXT"),
+              ("tokens", "kind", "TEXT NOT NULL DEFAULT 'pons'")]
 
 
 @dataclass
@@ -140,6 +136,8 @@ class Token:
     phantom: int | None   # the curve's virtual quote reserve, not counted toward graduation
     graduated: bool
     added_at: int
+    kind: str = "pons"    # "pons": its curve, then its v4 pool; "flap": its Flap curve;
+                          # "dex": the pools in `pools`
 
 
 @dataclass
@@ -152,7 +150,6 @@ class Chat:
     step_usd: float
     media_kind: str | None
     media_file_id: str | None
-    pro_until: int
     active: bool
     created_at: int
     sells: bool = False  # post sells too
@@ -162,9 +159,6 @@ class Chat:
     kind: str | None = None      # "channel", "supergroup", "group"
     thread_id: int | None = None # the forum topic posts go to (set by /track sent in it)
     whale_usd: float = 1000.0    # buys from this many dollars get the 🐋 mark; 0 turns it off
-
-    def is_pro(self, now: float | None = None) -> bool:
-        return self.pro_until > (time.time() if now is None else now)
 
 
 @dataclass
@@ -177,38 +171,20 @@ class OutboxRow:
     attempts: int
 
 
-@dataclass
-class Ad:
-    id: int
-    user_id: int
-    text: str
-    url: str
-    days: int
-    price: int
-    status: str  # pending | approved | paid | rejected
-    starts_at: int | None
-    ends_at: int | None
-
-
 def _token(r: sqlite3.Row) -> Token:
     return Token(r["address"], r["curve"], r["deployer"], r["pair"], r["quote_symbol"],
                  r["quote_decimals"], r["quote_kind"], r["name"], r["symbol"], r["decimals"],
                  int(r["total_supply"]), int(r["threshold"]), r["pool_id"],
                  int(r["curve_k"]) if r["curve_k"] else None,
                  int(r["phantom"]) if r["phantom"] is not None else None,
-                 bool(r["graduated"]), r["added_at"])
+                 bool(r["graduated"]), r["added_at"], r["kind"])
 
 
 def _chat(r: sqlite3.Row) -> Chat:
     return Chat(r["chat_id"], r["title"], r["token"], r["min_usd"], r["emoji"], r["step_usd"],
-                r["media_kind"], r["media_file_id"], r["pro_until"], bool(r["active"]),
+                r["media_kind"], r["media_file_id"], bool(r["active"]),
                 r["created_at"], bool(r["sells"]), int(r["chart"]), r["lang"], r["added_by"], r["kind"],
                 r["thread_id"], r["whale_usd"])
-
-
-def _ad(r: sqlite3.Row) -> Ad:
-    return Ad(r["id"], r["user_id"], r["text"], r["url"], r["days"], r["price"], r["status"],
-              r["starts_at"], r["ends_at"])
 
 
 class Db:
@@ -222,7 +198,23 @@ class Db:
             have = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
             if column not in have:
                 self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        self._drop_paid_plan()
         self.conn.commit()
+
+    def _drop_paid_plan(self) -> None:
+        """0.4 removed Pro, ads and Stars payments. Their tables go when they are empty
+        (a self-hosted copy that holds real payments keeps them, with a warning), and so
+        do the cached menu animations of the removed screens. chats.pro_until stays,
+        unused, so that older code can still read the chats table."""
+        for table in ("ads", "payments"):
+            if self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                                 (table,)).fetchone() is None:
+                continue
+            if self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]:
+                log.warning("table %s has rows from the removed paid plan; kept", table)
+            else:
+                self.conn.execute(f"DROP TABLE {table}")
+        self.conn.execute("DELETE FROM meta WHERE key LIKE 'anim:%:pro:%' OR key LIKE 'anim:%:ads:%'")
 
     def close(self) -> None:
         self.conn.close()
@@ -290,18 +282,26 @@ class Db:
             self.conn.execute(
                 "INSERT INTO tokens(address, curve, deployer, pair, quote_symbol, quote_decimals, "
                 "quote_kind, name, symbol, decimals, total_supply, threshold, pool_id, curve_k, "
-                "phantom, graduated, added_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "phantom, graduated, added_at, kind) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(address) DO UPDATE SET graduated=MAX(graduated, excluded.graduated), "
                 "curve_k=COALESCE(tokens.curve_k, excluded.curve_k), "
                 "phantom=COALESCE(tokens.phantom, excluded.phantom)",
                 (t.address, t.curve, t.deployer, t.pair, t.quote_symbol, t.quote_decimals,
                  t.quote_kind, t.name, t.symbol, t.decimals, str(t.total_supply), str(t.threshold),
                  t.pool_id, str(t.curve_k) if t.curve_k else None,
-                 str(t.phantom) if t.phantom is not None else None, int(t.graduated), t.added_at))
+                 str(t.phantom) if t.phantom is not None else None, int(t.graduated), t.added_at,
+                 t.kind))
 
     def get_token(self, address: str) -> Token | None:
         r = self.conn.execute("SELECT * FROM tokens WHERE address=?", (address.lower(),)).fetchone()
         return _token(r) if r else None
+
+    def tokens_with_symbol(self, symbol: str) -> list[tuple[str, str, int]]:
+        """(symbol, address, added_at) of every token a chat ever tracked with this symbol
+        ($ and case aside): what /scan compares a ticker against."""
+        want = (symbol or "").strip().lstrip("$").lower()
+        rows = self.conn.execute("SELECT symbol, address, added_at FROM tokens").fetchall()
+        return [(r[0], r[1], r[2]) for r in rows if r[0].strip().lstrip("$").lower() == want]
 
     def tracked_tokens(self) -> list[Token]:
         rows = self.conn.execute(
@@ -312,6 +312,74 @@ class Db:
     def mark_graduated(self, address: str) -> None:
         with self.conn:
             self.conn.execute("UPDATE tokens SET graduated=1 WHERE address=?", (address.lower(),))
+
+    def set_main_quote(self, address: str, pair: str, symbol: str, decimals: int, kind: str) -> None:
+        """A dex token's main quote (its deepest pool's) changed: charts and market cap
+        follow it. Trades kept in other units are dropped, not mixed with the new ones
+        (ETH and WETH, or two dollar quotes, are the same units)."""
+        address = address.lower()
+        with self.conn:
+            old = self.conn.execute("SELECT pair, quote_kind FROM tokens WHERE address=?", (address,)).fetchone()
+            if old is None or old["pair"] == pair:
+                return
+            self.conn.execute("UPDATE tokens SET pair=?, quote_symbol=?, quote_decimals=?, quote_kind=? "
+                              "WHERE address=?", (pair, symbol, decimals, kind, address))
+            if not (old["quote_kind"] == kind and kind in ("eth", "usd")):
+                self.conn.execute("DELETE FROM trades WHERE token=?", (address,))
+
+    def graduate_to_pools(self, address: str, pools: list) -> None:
+        """A curve token (Flap) graduated: from now on it is followed through its pools."""
+        address = address.lower()
+        with self.conn:
+            self.conn.execute("UPDATE tokens SET kind='dex', graduated=1 WHERE address=?", (address,))
+        self.set_pools(address, pools)
+        main = pools[0]
+        self.set_main_quote(address, main.quote, main.quote_symbol, main.quote_decimals, main.quote_kind)
+
+    def reprice_quotes(self, known: dict) -> int:
+        """Tokens stored with a quote the bot could not value, that it now can (a new
+        entry in quotes.QUOTES): they get the quote's kind. Returns how many changed."""
+        n = 0
+        with self.conn:
+            for r in self.conn.execute("SELECT address, pair FROM tokens WHERE quote_kind='other'").fetchall():
+                if r["pair"] in known:
+                    self.conn.execute("UPDATE tokens SET quote_kind=? WHERE address=?",
+                                      (known[r["pair"]][2], r["address"]))
+                    n += 1
+            for r in self.conn.execute("SELECT token, pool, quote FROM pools WHERE quote_kind='other'").fetchall():
+                if r["quote"] in known:
+                    self.conn.execute("UPDATE pools SET quote_kind=? WHERE token=? AND pool=?",
+                                      (known[r["quote"]][2], r["token"], r["pool"]))
+                    n += 1
+        return n
+
+    # --- pools of dex tokens ---
+    def set_pools(self, token: str, pools: list) -> None:
+        """Replace the pools watched for a token (pools.Pool items)."""
+        token = token.lower()
+        with self.conn:
+            self.conn.execute("DELETE FROM pools WHERE token=?", (token,))
+            self.conn.executemany(
+                "INSERT INTO pools(token, venue, pool, quote, quote_symbol, quote_decimals, quote_kind, "
+                "dex, liquidity_usd) VALUES (?,?,?,?,?,?,?,?,?)",
+                [(token, p.venue, p.id, p.quote, p.quote_symbol, p.quote_decimals, p.quote_kind, p.dex,
+                  p.liquidity_usd) for p in pools])
+
+    def pools_of(self, token: str) -> list:
+        from .pools import Pool
+        rows = self.conn.execute("SELECT * FROM pools WHERE token=? ORDER BY liquidity_usd DESC",
+                                 (token.lower(),)).fetchall()
+        return [Pool(r["token"], r["venue"], r["pool"], r["quote"], r["quote_symbol"], r["quote_decimals"],
+                     r["quote_kind"], r["dex"], r["liquidity_usd"]) for r in rows]
+
+    def tracked_pools(self) -> list:
+        """The pools of every tracked dex token."""
+        from .pools import Pool
+        rows = self.conn.execute(
+            "SELECT p.* FROM pools p JOIN tokens t ON t.address=p.token WHERE t.kind='dex' AND p.token IN "
+            "(SELECT DISTINCT token FROM chats WHERE active=1 AND token IS NOT NULL)").fetchall()
+        return [Pool(r["token"], r["venue"], r["pool"], r["quote"], r["quote_symbol"], r["quote_decimals"],
+                     r["quote_kind"], r["dex"], r["liquidity_usd"]) for r in rows]
 
     # --- chats ---
     def ensure_chat(self, chat_id: int, title: str = "") -> Chat:
@@ -365,21 +433,6 @@ class Db:
         total = self.conn.execute("SELECT COUNT(*) FROM chats WHERE active=1").fetchone()[0]
         return [_chat(r) for r in rows], total
 
-    def pro_chats(self, now: float | None = None) -> list[Chat]:
-        t = int(time.time() if now is None else now)
-        rows = self.conn.execute("SELECT * FROM chats WHERE pro_until>? ORDER BY pro_until DESC",
-                                 (t,)).fetchall()
-        return [_chat(r) for r in rows]
-
-    def set_pro_until(self, chat_id: int, until: int) -> None:
-        """The owner's hand on Pro: grant up to a date, or take it away (until = now)."""
-        with self.conn:
-            self.conn.execute("UPDATE chats SET pro_until=? WHERE chat_id=?", (until, chat_id))
-
-    def recent_payments(self, limit: int = 15) -> list[sqlite3.Row]:
-        return self.conn.execute("SELECT * FROM payments ORDER BY created_at DESC LIMIT ?",
-                                 (limit,)).fetchall()
-
     def unclaimed_chats(self, limit: int = 50) -> list[Chat]:
         """Active chats joined before the bot recorded who added it."""
         rows = self.conn.execute("SELECT * FROM chats WHERE active=1 AND added_by IS NULL "
@@ -411,14 +464,6 @@ class Db:
         rows = self.conn.execute("SELECT * FROM chats WHERE token=? AND active=1",
                                  (token.lower(),)).fetchall()
         return [_chat(r) for r in rows]
-
-    def extend_pro(self, chat_id: int, seconds: int, now: int | None = None) -> int:
-        now = int(time.time()) if now is None else now
-        with self.conn:
-            self.conn.execute("UPDATE chats SET pro_until=MAX(pro_until, ?) + ? WHERE chat_id=?",
-                              (now, seconds, chat_id))
-        chat = self.get_chat(chat_id)
-        return chat.pro_until if chat else 0
 
     # --- outbox ---
     def commit_tick(self, rows: list[tuple[int, str, str, dict]], last_block: int,
@@ -458,6 +503,17 @@ class Db:
         rows = self.conn.execute("SELECT ts, price, quote, side FROM trades WHERE token=? AND ts>=? "
                                  "ORDER BY ts, uid", (token.lower(), ts)).fetchall()
         return [tuple(r) for r in rows]
+
+    def day_counts(self, token: str, since: int) -> dict:
+        """Trades of a token since a time: buys, sells, their volume in its main quote, and
+        how many different wallets bought and sold (where the wallet is known)."""
+        r = self.conn.execute(
+            "SELECT SUM(side=1), SUM(side=-1), COALESCE(SUM(CASE WHEN side=1 THEN quote END), 0), "
+            "COALESCE(SUM(CASE WHEN side=-1 THEN quote END), 0), "
+            "COUNT(DISTINCT CASE WHEN side=1 THEN wallet END), COUNT(DISTINCT CASE WHEN side=-1 THEN wallet END) "
+            "FROM trades WHERE token=? AND ts>=?", (token.lower(), since)).fetchone()
+        return {"buys": r[0] or 0, "sells": r[1] or 0, "buy_quote": r[2], "sell_quote": r[3],
+                "buyers": r[4], "sellers": r[5]}
 
     def top_buyers(self, token: str, since: int, limit: int = 10) -> tuple[list[tuple[str, float, int]], int]:
         """The wallets that bought the most (in quote units) since a time, and how many
@@ -507,71 +563,12 @@ class Db:
     def outbox_size(self) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
 
-    # --- payments ---
-    def record_payment(self, charge_id: str, user_id: int, amount: int, payload: str) -> bool:
-        """False if this charge was already recorded (Telegram may repeat an update)."""
-        with self.conn:
-            cur = self.conn.execute("INSERT OR IGNORE INTO payments(charge_id, user_id, amount, "
-                                    "payload, created_at) VALUES (?,?,?,?,?)",
-                                    (charge_id, user_id, amount, payload, int(time.time())))
-        return cur.rowcount == 1
-
-    def get_payment(self, charge_id: str) -> sqlite3.Row | None:
-        return self.conn.execute("SELECT * FROM payments WHERE charge_id=?", (charge_id,)).fetchone()
-
-    def mark_refunded(self, charge_id: str) -> None:
-        with self.conn:
-            self.conn.execute("UPDATE payments SET refunded=1 WHERE charge_id=?", (charge_id,))
-
-    # --- ads ---
-    def create_ad(self, user_id: int, text: str, url: str, days: int, price: int) -> int:
-        with self.conn:
-            cur = self.conn.execute("INSERT INTO ads(user_id, text, url, days, price, status, "
-                                    "created_at) VALUES (?,?,?,?,?, 'pending', ?)",
-                                    (user_id, text, url, days, price, int(time.time())))
-        return cur.lastrowid
-
-    def get_ad(self, ad_id: int) -> Ad | None:
-        r = self.conn.execute("SELECT * FROM ads WHERE id=?", (ad_id,)).fetchone()
-        return _ad(r) if r else None
-
-    def set_ad_status(self, ad_id: int, status: str) -> None:
-        with self.conn:
-            self.conn.execute("UPDATE ads SET status=? WHERE id=?", (status, ad_id))
-
-    def schedule_paid_ad(self, ad_id: int, charge_id: str, now: int | None = None) -> tuple[int, int]:
-        """Queue a paid ad after every ad already paid for: slots never overlap."""
-        now = int(time.time()) if now is None else now
-        with self.conn:
-            ad = self.conn.execute("SELECT * FROM ads WHERE id=?", (ad_id,)).fetchone()
-            last_end = self.conn.execute(
-                "SELECT MAX(ends_at) FROM ads WHERE status='paid' AND id<>?", (ad_id,)).fetchone()[0]
-            starts = max(now, last_end or 0)
-            ends = starts + ad["days"] * 86400
-            self.conn.execute("UPDATE ads SET status='paid', starts_at=?, ends_at=?, charge_id=? "
-                              "WHERE id=?", (starts, ends, charge_id, ad_id))
-        return starts, ends
-
-    def current_ad(self, now: int | None = None) -> Ad | None:
-        now = int(time.time()) if now is None else now
-        r = self.conn.execute("SELECT * FROM ads WHERE status='paid' AND starts_at<=? AND ends_at>? "
-                              "ORDER BY starts_at LIMIT 1", (now, now)).fetchone()
-        return _ad(r) if r else None
-
-    def ads_by_status(self, status: str) -> list[Ad]:
-        rows = self.conn.execute("SELECT * FROM ads WHERE status=? ORDER BY id", (status,)).fetchall()
-        return [_ad(r) for r in rows]
-
     # --- stats ---
     def stats(self) -> dict:
         q = lambda sql: self.conn.execute(sql).fetchone()[0]  # noqa: E731
-        now = int(time.time())
         return {
             "chats_active": q("SELECT COUNT(*) FROM chats WHERE active=1"),
             "chats_tracking": q("SELECT COUNT(*) FROM chats WHERE active=1 AND token IS NOT NULL"),
-            "chats_pro": q(f"SELECT COUNT(*) FROM chats WHERE active=1 AND pro_until>{now}"),
             "tokens_tracked": len(self.tracked_tokens()),
             "outbox": self.outbox_size(),
-            "stars_total": q("SELECT COALESCE(SUM(amount),0) FROM payments WHERE refunded=0"),
-            "ads_pending": q("SELECT COUNT(*) FROM ads WHERE status='pending'"),
         }

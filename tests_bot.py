@@ -19,7 +19,7 @@ from aiogram.client.session.base import BaseSession
 from aiogram.exceptions import TelegramForbiddenError
 from aiogram.types import (BotDescription, BotShortDescription, CallbackQuery, Chat, ChatMemberLeft,
                            ChatMemberMember, ChatMemberOwner, ChatMemberUpdated, Message, MessageEntity,
-                           MessageOriginChannel, PreCheckoutQuery, SuccessfulPayment, Update, User,
+                           MessageOriginChannel, Update, User,
                            Animation)
 
 from buybot import abi, chain, profile, render
@@ -30,13 +30,27 @@ from buybot.sender import Sender
 
 FIX = json.loads((Path(__file__).parent / "fixtures" / "pons_v2_mainnet.json").read_text())
 TOKEN = FIX["launch"]["token"]
+DEX_TOKEN = "0x" + "d1" * 20   # sorts after WETH: token1 of its pool
+DEX_POOL = "0x" + "90" * 20
 GROUP, CHANNEL = -1001, -1002
-ADMIN, MEMBER, OWNER, ADVERTISER = 10, 11, 99, 12
+ADMIN, MEMBER, OWNER = 10, 11, 99
 BOT_ID = 42
 
 
 def now():
     return datetime.now(timezone.utc)
+
+
+def _transfer(frm, to, value, block):
+    return {"address": TOKEN, "blockNumber": hex(block), "logIndex": "0x0", "transactionHash": "0x" + format(block, "064x"),
+            "data": "0x" + format(value, "064x"),
+            "topics": [chain.TOPIC_TRANSFER, abi.address_topic(frm), abi.address_topic(to)]}
+
+
+# TOKEN's Transfers: minted to its curve, a sniper's buy in the next block, a buy much later
+TOKEN_HISTORY = [_transfer(abi.ZERO_ADDRESS, FIX["launch"]["curve"], 10 ** 27, 100),
+                 _transfer(FIX["launch"]["curve"], "0x" + "51" * 20, 10 ** 24, 101),
+                 _transfer(FIX["launch"]["curve"], "0x" + "52" * 20, 2 * 10 ** 24, 500)]
 
 
 class FakeSession(BaseSession):
@@ -84,9 +98,35 @@ class FakeSession(BaseSession):
 
 
 class FakeRpc:
+    """Answers the Pons factory for TOKEN, ERC-20 reads for any address, and, for
+    DEX_TOKEN, one Uniswap v3 pool against WETH, 50 WETH deep."""
     calls = errors = 0
 
+    async def block_number(self):
+        return 1000
+
+    async def get_logs(self, frm, to, address=None, topics=None):
+        from buybot import pools
+        if address == TOKEN and topics and topics[0] == chain.TOPIC_TRANSFER:  # TOKEN's history, for /scan
+            return [lg for lg in TOKEN_HISTORY if frm <= int(lg["blockNumber"], 16) <= to
+                    and (len(topics) < 2 or lg["topics"][1] == topics[1])]
+        if topics and topics[0] == pools.TOPIC_V3_POOL_CREATED and topics[1] == abi.address_topic(DEX_TOKEN) \
+                and address == next(iter(pools.V3_FACTORIES)):  # each factory answers for its own pools
+            return [{"address": next(iter(pools.V3_FACTORIES)), "blockNumber": "0x1", "logIndex": "0x0",
+                     "transactionHash": "0x" + "ee" * 32, "data": "0x" + format(60, "064x") + abi.encode_address(DEX_POOL),
+                     "topics": [pools.TOPIC_V3_POOL_CREATED, abi.address_topic(DEX_TOKEN),
+                                abi.address_topic("0x0bd7d308f8e1639fab988df18a8011f41eacad73"),
+                                "0x" + format(3000, "064x")]}]
+        return []
+
     async def eth_call(self, to, data, block="latest"):
+        from buybot import pools
+        if data.startswith(pools.SEL_V3_SLOT0):  # price 1: the quote depth is the liquidity
+            return "0x" + format(2 ** 96, "064x") + "00" * 32 * 6
+        if data.startswith(pools.SEL_V3_LIQUIDITY):
+            return "0x" + format(50 * 10 ** 18, "064x")
+        if data.startswith(chain.SEL_BALANCE_OF):
+            return "0x" + format(50 * 10 ** 18, "064x")
         sel = data[:10]
         q = abi.word_uint(abi.to_bytes(FIX["launch"]["get_reserves_return"]), 0)
         string = lambda s: "0x" + format(32, "064x") + format(len(s), "064x") + s.encode().hex().ljust(64, "0")  # noqa: E731
@@ -135,7 +175,7 @@ class BotFlow(unittest.IsolatedAsyncioTestCase):
                        username="testbuybot")
         self.dp = Dispatcher()
         self.dp.include_router(build_router(self.app))
-        self.sender = Sender(self.bot, self.db, "testbuybot", trade_url=self.cfg.trade_url,
+        self.sender = Sender(self.bot, self.db, trade_url=self.cfg.trade_url,
                              explorer="https://explorer", chat_interval=0)
         self.uid = 0
 
@@ -147,9 +187,15 @@ class BotFlow(unittest.IsolatedAsyncioTestCase):
         self.uid += 1
         await self.dp.feed_update(self.bot, Update(update_id=self.uid, **kind))
 
-    def last_text(self, name="SendMessage"):
-        calls = self.session.sent(name)
-        return (calls[-1].text if name == "SendMessage" else calls[-1].caption) if calls else None
+    def last_text(self, name=None):
+        """The text of the last message sent (a post's caption when it came as a card)."""
+        if name is None:
+            calls = [c for c in self.session.calls if type(c).__name__ in ("SendMessage", "SendAnimation", "SendPhoto")]
+        else:
+            calls = self.session.sent(name)
+        if not calls:
+            return None
+        return calls[-1].text if type(calls[-1]).__name__ == "SendMessage" else calls[-1].caption
 
     async def join(self, chat_id, chat_type="supergroup"):
         await self.feed(my_chat_member=ChatMemberUpdated(
@@ -192,24 +238,39 @@ class BotFlow(unittest.IsolatedAsyncioTestCase):
         await self.feed(message=message(GROUP, ADMIN, "/settings"))
         self.assertIn("Min buy: $50.00", self.last_text())
 
-    async def test_not_a_pons_token(self):
+    async def test_a_token_without_pools(self):
         await self.join(GROUP)
         await self.feed(message=message(GROUP, ADMIN, "/track 0x" + "12" * 20))
-        self.assertIn("not a Pons v2 token", self.last_text())
+        self.assertIn("has no pool I can read yet", self.last_text())
         self.assertIsNone(self.db.get_chat(GROUP).token)
+
+    async def test_any_token_with_a_uniswap_pool(self):
+        await self.join(GROUP)
+        await self.feed(message=message(GROUP, ADMIN, f"/track {DEX_TOKEN}"))
+        text = self.last_text()
+        self.assertIn("Tracking started", text)
+        self.assertIn("🦄 Pools: Uniswap v3 · WETH ($300K)", text)  # 2 × 50 WETH at $3,000
+        token = self.db.get_token(DEX_TOKEN)
+        self.assertEqual((token.kind, token.quote_symbol, token.quote_kind), ("dex", "WETH", "eth"))
+        self.assertEqual([p.id for p in self.db.pools_of(DEX_TOKEN)], [DEX_POOL])
+        await self.feed(message=message(GROUP, ADMIN, "/settings"))
+        self.assertIn("(Uniswap v3 · WETH)", self.last_text())
 
     async def test_preview_and_real_posts(self):
         await self.track()
         await self.feed(message=message(GROUP, ADMIN, "/test"))
         self.assertIn("TEST POST", self.last_text())
-        self.assertIn("via @testbuybot", self.last_text())
+        self.assertIn("NFA · DYOR", self.last_text())
+        self.assertNotIn("via @", self.last_text())
 
         self.buy_row(1)
         await self.sender.flush()
         text = self.last_text()
-        self.assertIn("TST Buy!", text)
+        self.assertIn("BUY</b> · <b>$TST", text)
         self.assertIn("$300", text)
-        markup = self.session.sent("SendMessage")[-1].reply_markup
+        for promo in ("via @", "Advertise", "Free buy alerts", "start=ads"):
+            self.assertNotIn(promo, text)  # every chat: no ad, no promotion
+        markup = [c for c in self.session.calls if type(c).__name__ in ("SendMessage", "SendAnimation")][-1].reply_markup
         self.assertEqual(markup.inline_keyboard[0][0].url, f"https://gmgn.ai/robinhood/token/REF_{TOKEN}")
         self.assertEqual(self.db.outbox_size(), 0)
 
@@ -228,37 +289,8 @@ class BotFlow(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.db.get_chat(GROUP).active)
         self.assertEqual(self.db.outbox_size(), 0)
 
-    async def test_pro_purchase_and_media(self):
+    async def test_media_for_every_chat(self):
         await self.track()
-        await self.feed(message=message(ADMIN, ADMIN, f"/start pro_{GROUP}", chat_type="private"))
-        offer = self.session.sent("SendMessage")[-1]
-        self.assertIn("Pro for", offer.text)
-        data = offer.reply_markup.inline_keyboard[0][0].callback_data
-        self.assertEqual(data, f"pro:{GROUP}:1")
-
-        await self.feed(callback_query=CallbackQuery(id="1", from_user=user(ADMIN), chat_instance="c",
-                                                     data=data))
-        invoice = self.session.sent("SendInvoice")[-1]
-        self.assertEqual((invoice.currency, invoice.prices[0].amount), ("XTR", 500))
-
-        await self.feed(pre_checkout_query=PreCheckoutQuery(
-            id="p1", from_user=user(ADMIN), currency="XTR", total_amount=499,
-            invoice_payload=invoice.payload))
-        self.assertFalse(self.session.sent("AnswerPreCheckoutQuery")[-1].ok)
-        await self.feed(pre_checkout_query=PreCheckoutQuery(
-            id="p2", from_user=user(ADMIN), currency="XTR", total_amount=500,
-            invoice_payload=invoice.payload))
-        self.assertTrue(self.session.sent("AnswerPreCheckoutQuery")[-1].ok)
-
-        paid = SuccessfulPayment(currency="XTR", total_amount=500, invoice_payload=invoice.payload,
-                                 telegram_payment_charge_id="ch1", provider_payment_charge_id="")
-        for _ in range(2):  # Telegram may deliver the same payment twice
-            await self.feed(message=message(ADMIN, ADMIN, "", chat_type="private").model_copy(
-                update={"text": None, "entities": None, "successful_payment": paid}))
-        chat = self.db.get_chat(GROUP)
-        self.assertTrue(chat.is_pro())
-        self.assertAlmostEqual(chat.pro_until - time.time(), 7 * 86400, delta=60)
-
         gif = message(GROUP, ADMIN, "x").model_copy(update={
             "text": None, "entities": None,
             "animation": Animation(file_id="GIF1", file_unique_id="u", width=1, height=1, duration=1)})
@@ -267,32 +299,55 @@ class BotFlow(unittest.IsolatedAsyncioTestCase):
         self.buy_row(1)
         await self.sender.flush()
         caption = self.last_text("SendAnimation")
-        self.assertIn("TST Buy!", caption)
-        self.assertNotIn("via @", caption)  # Pro: no ad line
+        self.assertIn("BUY</b> · <b>$TST", caption)
+        self.assertNotIn("via @", caption)
+        await self.feed(message=message(GROUP, ADMIN, "/settings"))
+        self.assertIn("Media: animation", self.last_text())
+        self.assertNotIn("(Pro)", self.last_text())
+        await self.feed(message=message(GROUP, ADMIN, "/media off"))
+        self.assertIsNone(self.db.get_chat(GROUP).media_file_id)
 
-    async def test_ad_flow(self):
+    async def test_nothing_is_sold(self):
+        """Old commands, deep links and buttons of the removed paid plan lead nowhere paid."""
         await self.track()
-        await self.feed(message=message(ADVERTISER, ADVERTISER,
-                                        "/advertise 2 https://t.me/other Join the OTHER chat",
-                                        chat_type="private"))
-        review = [c for c in self.session.sent("SendMessage") if c.chat_id == OWNER][-1]
-        self.assertIn("Join the OTHER chat", review.text)
-        ok = review.reply_markup.inline_keyboard[0][0].callback_data
-        await self.feed(callback_query=CallbackQuery(id="2", from_user=user(MEMBER), chat_instance="c",
-                                                     data=ok))
-        self.assertEqual(self.db.get_ad(1).status, "pending")  # only the owner can approve
-        await self.feed(callback_query=CallbackQuery(id="3", from_user=user(OWNER), chat_instance="c",
-                                                     data=ok))
-        invoice = self.session.sent("SendInvoice")[-1]
-        self.assertEqual((invoice.chat_id, invoice.prices[0].amount), (ADVERTISER, 1500))
-        paid = SuccessfulPayment(currency="XTR", total_amount=1500, invoice_payload=invoice.payload,
-                                 telegram_payment_charge_id="ch2", provider_payment_charge_id="")
-        await self.feed(message=message(ADVERTISER, ADVERTISER, "", chat_type="private").model_copy(
-            update={"text": None, "entities": None, "successful_payment": paid}))
-        self.assertEqual(self.db.get_ad(1).status, "paid")
-        self.buy_row(1)
-        await self.sender.flush()
-        self.assertIn("Join the OTHER chat", self.last_text())
+        replies = len(self.session.sent("SendMessage"))
+        await self.feed(message=message(GROUP, ADMIN, "/pro"))
+        self.assertEqual(len(self.session.sent("SendMessage")), replies)  # not a command any more
+        self.db.set_user_lang(ADMIN, "en")
+        for text in ("/advertise 2 https://t.me/x Join", "/start ads", f"/start pro_{GROUP}"):
+            await self.feed(message=message(ADMIN, ADMIN, text, chat_type="private"))
+        for data in ("m:pro", "m:ads", f"pro:{GROUP}:1", "ad:ok:1", f"c:pro:{GROUP}", f"a:grant:{GROUP}:0"):
+            await self.callback(ADMIN, data)
+        self.assertEqual(self.session.sent("SendInvoice"), [])
+        self.assertIn("buy bot", self.last_caption())  # /start with an old argument opens the menu
+        self.assertEqual(self.session.sent("AnswerCallbackQuery")[-1].show_alert or False, True)  # a:… is the owner's
+
+    async def test_support_reaches_the_owners_once_in_a_while(self):
+        self.db.set_user_lang(MEMBER, "en")
+        await self.feed(message=message(MEMBER, MEMBER, "/support my posts stopped", chat_type="private"))
+        to_owner = [c for c in self.session.sent("SendMessage") if c.chat_id == OWNER]
+        self.assertIn("my posts stopped", to_owner[-1].text)
+        self.assertIn("Sent", self.last_text())
+        await self.feed(message=message(MEMBER, MEMBER, "/support again", chat_type="private"))
+        self.assertIn("wait", self.last_text())
+        self.assertEqual(len([c for c in self.session.sent("SendMessage") if c.chat_id == OWNER]), len(to_owner))
+
+        # the owner answers by replying; the answer goes back to the sender
+        forwarded = Message(message_id=500, date=now(), chat=Chat(id=OWNER, type="private"),
+                            text=f"🆘 /support from {MEMBER} (@u{MEMBER}):\nmy posts stopped")
+        await self.feed(message=message(OWNER, OWNER, "Fixed, try /test", chat_type="private",
+                                        reply_to_message=forwarded))
+        copy = self.session.sent("CopyMessage")[-1]
+        self.assertEqual((copy.chat_id, copy.from_chat_id), (MEMBER, OWNER))
+
+    async def test_support_that_reaches_nobody_does_not_lock_the_sender(self):
+        self.db.set_user_lang(MEMBER, "en")
+        self.session.fail[OWNER] = TelegramForbiddenError(method=None, message="Forbidden: bot was blocked")
+        await self.feed(message=message(MEMBER, MEMBER, "/support hello", chat_type="private"))
+        self.assertIn("Couldn't deliver", self.last_text())
+        del self.session.fail[OWNER]
+        await self.feed(message=message(MEMBER, MEMBER, "/support hello", chat_type="private"))
+        self.assertIn("Sent", self.last_text())
 
     async def test_channel_is_set_up_from_private_chat(self):
         await self.join(CHANNEL, chat_type="channel")
@@ -309,9 +364,9 @@ class BotFlow(unittest.IsolatedAsyncioTestCase):
 
         # plain commands in the private chat now apply to that channel, with a confirmation
         await self.feed(message=message(ADMIN, ADMIN, "/test", chat_type="private"))
-        sample, confirm = self.session.sent("SendMessage")[-2:]
+        sample, confirm = self.session.sent("SendAnimation")[-1], self.session.sent("SendMessage")[-1]
         self.assertEqual((sample.chat_id, confirm.chat_id), (CHANNEL, ADMIN))
-        self.assertIn("TEST POST", sample.text)
+        self.assertIn("TEST POST", sample.caption)
         self.assertIn("Sample post sent", confirm.text)
         await self.feed(message=message(ADMIN, ADMIN, "/settings", chat_type="private"))
         self.assertIn("Token: <b>TST</b>", self.last_text())
@@ -328,9 +383,9 @@ class BotFlow(unittest.IsolatedAsyncioTestCase):
         self.db.add_outbox(GROUP, "buy", "buy:1", p)
         self.db.add_outbox(GROUP, "sell", "sell:1", p)
         await self.sender.flush()
-        self.assertIn("TST Buy!", self.last_text())  # buys and sells are posted apiece
+        self.assertIn("BUY</b> · <b>$TST", self.last_text())  # buys and sells are posted apiece
         await self.sender.flush()
-        self.assertIn("TST Sell!", self.last_text())
+        self.assertIn("SELL</b> · <b>$TST", self.last_text())
 
         await self.feed(message=message(GROUP, ADMIN, "/sells off"))
         self.db.add_outbox(GROUP, "sell", "sell:2", p)
@@ -348,17 +403,17 @@ class BotFlow(unittest.IsolatedAsyncioTestCase):
         from buybot.chart import find_ffmpeg
         if find_ffmpeg():  # the default: an animated chart, an MP4 Telegram loops like a GIF
             anim = self.session.sent("SendAnimation")[-1]
-            self.assertIn("TST Buy!", anim.caption)
+            self.assertIn("BUY</b> · <b>$TST", anim.caption)
             self.assertEqual(anim.animation.data[4:8], b"ftyp")
             buttons = [b.callback_data for b in anim.reply_markup.inline_keyboard[0] if b.callback_data]
-            self.assertEqual(buttons, [f"s:{TOKEN}"])
+            self.assertEqual(buttons, [f"s:{TOKEN}", f"x:{TOKEN}"])
 
         await self.feed(message=message(GROUP, ADMIN, "/chart still"))
         self.assertIn("still picture", self.last_text())
         self.buy_row(2)
         await self.sender.flush()
         photo = self.session.sent("SendPhoto")[-1]
-        self.assertIn("TST Buy!", photo.caption)
+        self.assertIn("BUY</b> · <b>$TST", photo.caption)
         self.assertTrue(photo.photo.data.startswith(b"\x89PNG"))
 
         await self.feed(message=message(GROUP, ADMIN, "/chart off"))
@@ -366,7 +421,7 @@ class BotFlow(unittest.IsolatedAsyncioTestCase):
         self.buy_row(3)
         await self.sender.flush()
         self.assertEqual(len(self.session.sent("SendPhoto")), 1)
-        self.assertIn("TST Buy!", self.last_text())
+        self.assertIn("BUY</b> · <b>$TST", self.last_text())
 
         # 📊 24h under a post: a pop-up for whoever taps it, nothing posted in the chat
         posts = len(self.session.sent("SendMessage"))
@@ -464,7 +519,75 @@ class BotFlow(unittest.IsolatedAsyncioTestCase):
     async def test_terms_link_the_source(self):
         self.app.cfg = Config(bot_token="x", owner_ids=frozenset(), source_url="https://example.org/src")
         await self.feed(message=message(MEMBER, MEMBER, "/terms", chat_type="private"))
-        self.assertIn("Source code (AGPL-3.0): https://example.org/src", self.last_text("SendAnimation"))
+        terms = self.last_text("SendAnimation")
+        self.assertIn("Source code (AGPL-3.0): https://example.org/src", terms)
+        self.assertNotIn("Stars", terms)
+        self.assertIn("no ads", terms)
+
+    async def test_scan_in_a_group(self):
+        await self.track()
+        replies = len(self.session.sent("SendMessage"))
+        await self.feed(message=message(GROUP, MEMBER, "/scan"))
+        self.assertEqual(len(self.session.sent("SendMessage")), replies)  # admins only
+        await self.feed(message=message(GROUP, ADMIN, "/scan"))  # alone: the chat's own token
+        text = self.last_text()
+        self.assertIn("Scan · $TST</b> · Test Token", text)
+        self.assertIn("🎯 Snipers: <b>1</b> wallet bought in the first 5 s", text)
+        # the curve holds the rest and is not a holder; the dev holds what the chain says (balanceOf)
+        self.assertIn("👥 Holders: <b>3</b>", text)
+        self.assertNotIn(render.short_addr(FIX["launch"]["curve"]), text)
+        self.assertIn(f"👨‍💻 Dev <a href=\"https://robinhoodchain.blockscout.com/address/{FIX['launch']['deployer']}\">",
+                      text)  # the Pons deployer, from the factory's record
+        self.assertIn("honeypot", text)
+        await self.feed(message=message(GROUP, ADMIN, "/scan 0x" + "12" * 20))
+        self.assertIn("No mint of this token", self.last_text())
+        await self.feed(message=message(GROUP, ADMIN, "/scan nonsense"))
+        self.assertIn("/scan <code>0x…</code>", self.last_text())
+
+    async def test_scan_in_the_private_chat(self):
+        self.db.set_user_lang(MEMBER, "en")
+        await self.feed(message=message(MEMBER, MEMBER, f"/scan {TOKEN}", chat_type="private"))
+        self.assertIn("Scan · $TST", self.last_text())
+        await self.feed(message=message(MEMBER, MEMBER, f"/scan {DEX_TOKEN}", chat_type="private"))
+        self.assertIn("One scan a minute", self.last_text())  # a new token costs requests
+        await self.feed(message=message(MEMBER, MEMBER, f"/scan {TOKEN.upper().replace('0X', '0x')}",
+                                        chat_type="private"))
+        self.assertIn("Scan · $TST", self.last_text())  # the kept one costs nothing
+        await self.feed(message=message(MEMBER, MEMBER, "/scan", chat_type="private"))
+        self.assertIn("/scan <code>0x…</code>", self.last_text())  # no current chat
+
+    async def test_scan_button_under_a_post(self):
+        await self.track()
+        await self.callback(MEMBER, f"x:{TOKEN}")
+        first = self.session.sent("AnswerCallbackQuery")[-1]
+        self.assertTrue(first.show_alert)
+        self.assertIn("Scanning $TST", first.text)
+        await asyncio.gather(*self.app.tasks)  # the scan the tap started
+        await self.callback(MEMBER, f"x:{TOKEN}")
+        popup = self.session.sent("AnswerCallbackQuery")[-1]
+        self.assertIn("🛡 $TST", popup.text)
+        self.assertIn("Snipers: 1", popup.text)
+        self.assertIn("Honeypot not checked", popup.text)
+        self.assertLessEqual(len(popup.text), 200)
+        await self.callback(MEMBER, "x:0x" + "12" * 20)  # a token the bot does not know: nothing
+        self.assertIsNone(self.session.sent("AnswerCallbackQuery")[-1].text)
+
+        self.db.set_user_lang(ADMIN, "en")
+        await self.callback(ADMIN, f"c:scan:{GROUP}")  # from the chat's screen in the private chat
+        self.assertIn("Scan · $TST", self.last_caption())
+
+    async def test_dev_sell_posted_with_sells_off(self):
+        await self.track()
+        self.assertFalse(self.db.get_chat(GROUP).sells)
+        p = dict(render.sample_payload("TST", "ETH", 3000.0), token=TOKEN, tx="0x" + "cd" * 32)
+        self.db.add_outbox(GROUP, "sell", "sell:1", p)
+        self.db.add_outbox(GROUP, "sell", "sell:2", p | {"dev": True, "dev_sell": True,
+                                                       "holder": {"change": -0.5, "share": 0.02}})
+        await self.sender.flush()
+        text = self.last_text()
+        self.assertTrue(text.startswith("🚨 <b>DEV SELL</b> · <b>$TST</b>"), text)
+        self.assertIn("🚨 sold 50% of the bag · holds 2.00%", text)
+        self.assertEqual(self.db.outbox_size(), 0)  # the other sell was dropped: sells are off
 
     def callback(self, uid, data, text=None):
         """A button press under a menu screen (an animation with a caption)."""
@@ -502,8 +625,9 @@ class BotFlow(unittest.IsolatedAsyncioTestCase):
         self.assertIn("на русском", self.last_text())
         self.buy_row(1)
         await self.sender.flush()
-        self.assertIn("TST Покупка!", self.last_text())
-        self.assertIn("Бесплатные уведомления", self.last_text())
+        self.assertIn("ПОКУПКА</b> · <b>$TST", self.last_text())
+        self.assertIn("NFA · DYOR", self.last_text())
+        self.assertNotIn("Бесплатные уведомления", self.last_text())
         await self.feed(message=message(GROUP, ADMIN, "/settings"))
         self.assertIn("Мин. покупка", self.last_text())
 
@@ -524,6 +648,9 @@ class BotFlow(unittest.IsolatedAsyncioTestCase):
 
         await self.callback(ADMIN, f"m:chat:{GROUP}")
         self.assertIn("Settings", self.last_caption())
+        buttons = [b.callback_data for c in self.session.calls if type(c).__name__ == "EditMessageMedia"
+                   for row in (c.reply_markup.inline_keyboard if c.reply_markup else []) for b in row]
+        self.assertFalse([b for b in buttons if b and b.startswith("c:pro:")])
         self.assertEqual(self.db.dm_chat(ADMIN), GROUP)
         await self.callback(ADMIN, f"c:sells:{GROUP}")
         self.assertTrue(self.db.get_chat(GROUP).sells)
@@ -534,37 +661,30 @@ class BotFlow(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.session.sent("AnswerCallbackQuery")[-1].show_alert)
         self.assertTrue(self.db.get_chat(GROUP).sells)
 
-    async def test_owner_panel_and_pro_control(self):
-        from buybot.bot import FOREVER, claim_for_owners
+    async def test_owner_panel(self):
+        from buybot.bot import claim_for_owners
         await self.track()
         self.db.set_user_lang(OWNER, "en")
         await self.feed(message=message(OWNER, OWNER, "/admin", chat_type="private"))
-        self.assertIn("Control panel", self.last_caption())
-        self.assertIn("1</b> active", self.last_caption())
+        caption = self.last_caption()
+        self.assertIn("Control panel", caption)
+        self.assertIn("1</b> active", caption)
+        for gone in ("Pro", "Stars", "ads to review"):
+            self.assertNotIn(gone, caption)
+        await self.callback(OWNER, "a:chats:0")
+        self.assertIn("All chats", self.last_caption())
+        await self.callback(OWNER, f"a:chat:{GROUP}")
+        self.assertIn("Added by", self.last_caption())
 
-        await self.callback(OWNER, f"a:grant:{GROUP}:30")
-        self.assertAlmostEqual(self.db.get_chat(GROUP).pro_until - time.time(), 30 * 86400, delta=60)
-        self.assertIn("Pro until", self.session.sent("AnswerCallbackQuery")[-1].text)
-        await self.callback(OWNER, "a:pro")
-        self.assertIn("Chats with Pro</b> (1)", self.last_caption())
-        await self.callback(OWNER, f"a:grant:{GROUP}:0")
-        self.assertEqual(self.db.get_chat(GROUP).pro_until, FOREVER)
-        self.assertIn("forever", self.last_caption())
-        await self.callback(OWNER, f"a:revoke:{GROUP}")
-        self.assertFalse(self.db.get_chat(GROUP).is_pro())
-
-        await self.callback(ADMIN, f"a:grant:{GROUP}:0")  # not the owner
+        await self.callback(ADMIN, "a:chats:0")  # not the owner
         self.assertTrue(self.session.sent("AnswerCallbackQuery")[-1].show_alert)
-        self.assertFalse(self.db.get_chat(GROUP).is_pro())
         await self.feed(message=message(ADMIN, ADMIN, "/admin", chat_type="private"))
         self.assertNotIn("Control panel", self.last_caption() or "")
 
-        # a chat from before the bot recorded who added it: the owner admins it, so it is
-        # the owner's, and the owner's chats are Pro for good
+        # a chat from before the bot recorded who added it: the owner admins it, so it is the owner's
         self.db.ensure_chat(-1003, "Old channel")
         await claim_for_owners(self.bot, self.app)
-        old = self.db.get_chat(-1003)
-        self.assertEqual((old.added_by, old.pro_until), (OWNER, FOREVER))
+        self.assertEqual(self.db.get_chat(-1003).added_by, OWNER)
 
     async def test_top_buyers(self):
         await self.track()
@@ -600,6 +720,7 @@ class BotFlow(unittest.IsolatedAsyncioTestCase):
         await self.track()
         await self.feed(message=message(OWNER, OWNER, "/botstats", chat_type="private"))
         self.assertIn("chats_tracking: 1", self.last_text())
+        self.assertNotIn("stars_total", self.last_text())
         count = len(self.session.sent("SendMessage"))
         await self.feed(message=message(MEMBER, MEMBER, "/botstats", chat_type="private"))
         self.assertEqual(len(self.session.sent("SendMessage")), count)  # strangers get nothing
@@ -615,6 +736,15 @@ class ProfileSync(unittest.IsolatedAsyncioTestCase):
                                      profile.SHORT_DESCRIPTION_MAX)
                 self.assertIn("Robinhood", profile.DESCRIPTIONS[lang])  # the not-affiliated line
                 self.assertIn("Pons", profile.SHORT_DESCRIPTIONS[lang])
+                for gone in ("Pro", "Free forever", "Бесплатно навсегда", "ad line", "рекламной строки"):
+                    self.assertNotIn(gone, profile.DESCRIPTIONS[lang] + profile.SHORT_DESCRIPTIONS[lang])
+
+    def test_command_menus_sell_nothing(self):
+        from buybot import main
+        names = {c for c, _, _ in main.GROUP_COMMANDS + main.PRIVATE_COMMANDS}
+        self.assertFalse(names & {"pro", "advertise", "paysupport"})
+        self.assertIn("support", names)
+        self.assertFalse([d for _, en, ru in main.GROUP_COMMANDS for d in (en, ru) if "Pro" in d])
 
     async def test_sets_missing_texts_once(self):
         session = FakeSession()

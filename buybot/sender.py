@@ -9,11 +9,13 @@
 - Buys older than `max_age` seconds (after downtime) are dropped, not posted late.
 - Each buy or sell goes out as a price chart with the text as its caption: animated
   (a looping MP4 Telegram plays like a GIF) or, with /chart still, a picture. A chat
-  with charts off, or showing its own Pro media, gets no chart; without one, text.
+  with charts off, or showing its own media (/media), gets no chart; without one, text.
+- Every post ends the same way in every chat: no ad, no promotion.
 """
 
 import asyncio
 import logging
+import os
 import time
 
 from aiogram import Bot
@@ -22,11 +24,14 @@ from aiogram.exceptions import (TelegramBadRequest, TelegramForbiddenError,
                                 TelegramRetryAfter, TelegramServerError)
 from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 
-from . import render
+from . import emoji, heavy, render
 from .db import Chat, Db, OutboxRow
 from .i18n import t
 
 CHART_HOURS = 6
+# The trade card's frame rate. 30 by default: on the server (one core, a 30% CPU quota) a
+# 60 fps card takes ~30 s to draw, 30 fps ~13 s. CHART_FPS=60 where there is CPU to spare.
+CARD_FPS = int(os.environ.get("CHART_FPS", "30"))
 CHART_OFF, CHART_ANIMATED, CHART_STILL = 0, 1, 2
 
 log = logging.getLogger(__name__)
@@ -38,24 +43,45 @@ _BAD_MEDIA = ("wrong file identifier", "file_id", "wrong type", "failed to get h
               "wrong remote file")
 
 
-def keyboard(pairs: list[tuple[str, str]]) -> InlineKeyboardMarkup | None:
-    """One row of buttons: a value starting with https:// is a link, anything else a
-    callback (the 📊 24h pop-up)."""
+def keyboard(pairs: list[tuple], ids: dict[str, str] | None = None) -> InlineKeyboardMarkup | None:
+    """One row of buttons from (label, value[, colour]): a value starting with https:// is a
+    link, anything else a callback (the 24h pop-up). With the custom emoji ids, a label's
+    leading emoji becomes the badge icon of the button."""
     if not pairs:
         return None
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=label, url=v) if v.startswith("https://") else
-        InlineKeyboardButton(text=label, callback_data=v) for label, v in pairs]])
+    row = []
+    for label, v, *rest in pairs:
+        text, icon = emoji.split_icon(label, ids)
+        extra = {"style": rest[0]} if rest and rest[0] else {}
+        if icon:
+            extra["icon_custom_emoji_id"] = icon
+        row.append(InlineKeyboardButton(text=text, url=v, **extra) if v.startswith("https://") else
+                   InlineKeyboardButton(text=text, callback_data=v, **extra))
+    return InlineKeyboardMarkup(inline_keyboard=[row])
 
 
-async def send_post(bot: Bot, chat: Chat, text: str, pairs: list[tuple[str, str]],
-                    with_media: bool, chart: tuple[bytes, str] | None = None) -> None:
+async def send_post(bot: Bot, chat: Chat, text: str, pairs: list[tuple],
+                    with_media: bool, chart: tuple[bytes, str] | None = None,
+                    emoji_ids: dict[str, str] | None = None) -> None:
     """Send one post; raises aiogram exceptions for the caller to classify.
-    Pro media wins over the chart; a chart Telegram refuses falls back to text.
-    `chart` is (bytes, "animation" | "photo")."""
-    markup = keyboard(pairs)
+    A chat's own media wins over the chart; a chart Telegram refuses falls back to text.
+    `chart` is (bytes, "animation" | "photo"). With the custom emoji ids, where the chat
+    allows them, the post goes out with the badges; refused, it goes out plain."""
+    if emoji_ids and emoji.allowed(chat):
+        try:
+            await _send(bot, chat, emoji.brand(text, emoji_ids), keyboard(pairs, emoji_ids), with_media, chart)
+            return
+        except TelegramBadRequest as e:
+            if any(h in e.message.lower() for h in _GONE + _NO_TOPIC):
+                raise
+            log.warning("post with custom emoji refused in %s (%s), sending it plain", chat.chat_id, e.message)
+    await _send(bot, chat, text, keyboard(pairs), with_media, chart)
+
+
+async def _send(bot: Bot, chat: Chat, text: str, markup, with_media: bool,
+                chart: tuple[bytes, str] | None) -> None:
     topic = {"message_thread_id": chat.thread_id} if chat.thread_id else {}
-    if with_media and chat.media_file_id and chat.is_pro():
+    if with_media and chat.media_file_id:
         send = {"animation": bot.send_animation, "photo": bot.send_photo,
                 "video": bot.send_video}.get(chat.media_kind or "")
         if send:
@@ -65,10 +91,8 @@ async def send_post(bot: Bot, chat: Chat, text: str, pairs: list[tuple[str, str]
         data, kind = chart
         try:
             if kind == "animation":
-                from .chart import ANIM_H, ANIM_W, SECONDS
                 await bot.send_animation(chat.chat_id, BufferedInputFile(data, "chart.mp4"), caption=text,
-                                         reply_markup=markup, width=ANIM_W, height=ANIM_H,
-                                         duration=int(SECONDS), **topic)
+                                         reply_markup=markup, **topic)
             else:
                 await bot.send_photo(chat.chat_id, BufferedInputFile(data, "chart.png"), caption=text,
                                      reply_markup=markup, **topic)
@@ -81,7 +105,7 @@ async def send_post(bot: Bot, chat: Chat, text: str, pairs: list[tuple[str, str]
 
 
 def wants_chart(chat: Chat, with_media: bool) -> bool:
-    return bool(chat.chart) and not (with_media and chat.media_file_id and chat.is_pro())
+    return bool(chat.chart) and not (with_media and chat.media_file_id)
 
 
 def trade_amount(p: dict, side: int) -> str:
@@ -103,18 +127,98 @@ def card_text(p: dict, side: int, symbol: str, lang: str) -> dict:
             "detail": f"{render.fmt_num(p['quote'])} {p.get('quote_symbol', '')}".strip()}
 
 
+def venue_label(token, p: dict) -> str:
+    """Where the trade happened, for the card: Uniswap v3, Pons curve, vibe/vibe curve."""
+    if p.get("venue") in ("v2", "v3", "v4"):
+        return p.get("dex") or f"Uniswap {p['venue']}"
+    if p.get("launchpad"):
+        return f"{p['launchpad']} curve"
+    return {"flap": "Flap curve"}.get(getattr(token, "kind", ""), "Pons curve")
+
+
+def graduation_mc(token) -> float | None:
+    """A Pons curve token's market cap at graduation, in its quote: the curve's reserves when
+    the real quote reaches the threshold (constant product over the virtual reserve)."""
+    if getattr(token, "kind", "pons") != "pons" or token.graduated or not token.curve_k \
+            or token.phantom is None or not token.threshold:
+        return None
+    q = token.phantom + token.threshold
+    t = token.curve_k / q
+    if t <= 0:
+        return None
+    price = q / t * 10 ** (token.decimals - token.quote_decimals)
+    return price * token.total_supply / 10 ** token.decimals
+
+
+def card_spec(db: Db, token, p: dict, side: int, usd_per_quote: float | None,
+              whale_usd: float = 0, now: float | None = None) -> dict:
+    """What the trade card shows, from the post's payload and the token's kept trades.
+    Anything unknown is None and the card leaves it out."""
+    now = int(time.time() if now is None else now)
+    points = db.trades_since(token.address, now - CHART_HOURS * 3600)
+    day = db.day_counts(token.address, now - 86400)
+    usd = usd_per_quote
+    first = points[0][1] if points else None
+    last = p.get("price") or (points[-1][1] if points else None)
+    return {
+        "theme": "vibe" if p.get("launchpad") == "vibe/vibe" else "silverhand",
+        "side": side, "symbol": token.symbol, "name": token.name,
+        "network": p.get("network") or "Robinhood Chain", "venue": venue_label(token, p),
+        "usd": p.get("usd"), "quote": p.get("quote"), "quote_symbol": p.get("quote_symbol") or token.quote_symbol,
+        "tokens": p.get("tokens"), "mc_usd": p.get("mc_usd"), "mc_quote": p.get("mc_quote"),
+        "price_change": (last / first - 1) if first and last else None, "progress": p.get("progress"),
+        "buyer": render.short_addr(p["buyer"]) if p.get("buyer") else None, "holder": p.get("holder"),
+        "whale": side > 0 and bool(whale_usd) and (p.get("usd") or 0) >= whale_usd, "dev": bool(p.get("dev")),
+        "day": {"buys": day["buys"], "sells": day["sells"],
+                "buy_volume_usd": day["buy_quote"] * usd if usd else None,
+                "sell_volume_usd": day["sell_quote"] * usd if usd else None,
+                "buyers": day["buyers"] or None, "sellers": day["sellers"] or None} if day["buys"] + day["sells"] else None,
+        "points": [list(pt) for pt in points], "supply": token.total_supply / 10 ** token.decimals,
+        "usd_per_quote": usd, "now": now, "grad_mc_quote": graduation_mc(token),
+    }
+
+
 async def make_chart(db: Db, p: dict, side: int, mode: int = CHART_ANIMATED,
-                     lang: str = "en") -> tuple[bytes, str] | None:
-    """The chart for a trade payload as (bytes, kind), or None (charts off, no Pillow,
-    too few trades, a failure). An animation that cannot be made falls back to a
-    picture. Drawing runs off the event loop."""
+                     lang: str = "en", whale_usd: float = 0) -> tuple[bytes, str] | None:
+    """The card for a trade payload as (bytes, kind), or None (charts off, no Pillow,
+    a failure). An animation that cannot be made falls back to a picture. Milestones
+    keep the older chart. Drawing runs off the event loop, one card at a time
+    (heavy.slot), and its memory goes back to the system after."""
+    if mode == CHART_OFF:
+        return None
+    async with heavy.slot():
+        try:
+            return await _make_chart(db, p, side, mode, lang, whale_usd)
+        finally:
+            heavy.release()
+
+
+async def _make_chart(db: Db, p: dict, side: int, mode: int, lang: str,
+                      whale_usd: float) -> tuple[bytes, str] | None:
     token = db.get_token(p["token"]) if p.get("token") else None
     if token is None or mode == CHART_OFF:
         return None
     points = db.trades_since(token.address, int(time.time() - CHART_HOURS * 3600))
-    usd_per_quote = p["usd"] / p["quote"] if p.get("usd") and p.get("quote") else None
+    # the chart is in the token's main quote; a pool trade may be in another one
+    if "main_usd" in p:
+        usd_per_quote = p["main_usd"]
+    else:  # a payload from before pools, or a test post: its own quote is the main one
+        usd_per_quote = p["usd"] / p["quote"] if p.get("usd") and p.get("quote") else None
     if usd_per_quote is None and token.quote_kind == "usd":
         usd_per_quote = 1.0
+    if not p.get("what"):  # a trade: the dashboard card
+        try:
+            from . import card
+            spec = card_spec(db, token, p, side, usd_per_quote, whale_usd)
+            if mode == CHART_ANIMATED:
+                try:
+                    return await asyncio.to_thread(card.render_card, spec, fps=CARD_FPS), "animation"
+                except Exception:
+                    log.exception("animated card for %s failed, sending a picture", token.symbol)
+            return await asyncio.to_thread(card.render_still, spec), "photo"
+        except Exception:
+            log.exception("card for %s failed", token.symbol)
+            return None
     args = dict(symbol=token.symbol, supply=token.total_supply / 10 ** token.decimals,
                 usd_per_quote=usd_per_quote, quote_symbol=token.quote_symbol, side=side)
     try:
@@ -135,11 +239,10 @@ async def make_chart(db: Db, p: dict, side: int, mode: int = CHART_ANIMATED,
 
 
 class Sender:
-    def __init__(self, bot: Bot, db: Db, username: str, *, trade_url: str, explorer: str,
+    def __init__(self, bot: Bot, db: Db, *, trade_url: str, explorer: str,
                  chat_interval: float = 3.0, global_rate: float = 25.0, max_age: float = 600.0):
         self.bot = bot
         self.db = db
-        self.username = username
         self.trade_url = trade_url
         self.explorer = explorer
         self.chat_interval = chat_interval
@@ -147,7 +250,6 @@ class Sender:
         self.max_age = max_age
         self._next_chat: dict[int, float] = {}
         self._next_global = 0.0
-        self._variant = 0
         self.sent = 0
         self.dropped = 0
 
@@ -207,12 +309,18 @@ class Sender:
             return batch, text, pairs, False, (p, 1)
         token = chat.token
         stale = [r for r in items if r.payload.get("token") != token
-                 or (r.kind == "sell" and not chat.sells)]
+                 or (r.kind == "sell" and not chat.sells and not r.payload.get("dev_sell"))]
         if stale:  # a token the chat no longer tracks, or sells it turned off
             self.db.delete_outbox([r.id for r in stale])
         items = [r for r in items if r not in stale]
         if not items:
             return [], "", [], False, None
+        dev = [r for r in items if r.kind == "sell" and r.payload.get("dev_sell")]
+        if dev:  # a dev sell goes out first and on its own, never summed into other sells
+            batch = dev[:1]
+            main = batch[0].payload
+            text = render.buy_text(main, chat, explorer=self.explorer, sell=True)
+            return batch, text, render.buttons(main, self.trade_url, self.explorer), True, (main, -1)
         # Buys and sells are never merged: one post per kind, oldest kind first.
         kind = items[0].kind
         batch = [r for r in items if r.kind == kind]
@@ -227,12 +335,10 @@ class Sender:
             return False
         chart = None
         if trade and wants_chart(chat, with_media):
-            chart = await make_chart(self.db, *trade, mode=chat.chart, lang=chat.lang)
+            chart = await make_chart(self.db, *trade, mode=chat.chart, lang=chat.lang,
+                                     whale_usd=chat.whale_usd)
         ids = [r.id for r in batch]
-        pro = chat.is_pro()
-        ad = None if pro else self.db.current_ad()
-        self._variant += 1
-        text += render.footer(pro, ad, self.username, self._variant // 7, chat.lang)
+        text += render.footer()
 
         wait = self._next_global - time.monotonic()
         if wait > 0:
@@ -240,7 +346,7 @@ class Sender:
         self._next_global = time.monotonic() + self.global_interval
         self._next_chat[chat.chat_id] = time.time() + self.chat_interval
         try:
-            await send_post(self.bot, chat, text, pairs, with_media, chart)
+            await send_post(self.bot, chat, text, pairs, with_media, chart, emoji.load(self.db))
         except TelegramRetryAfter as e:
             self._next_chat[chat.chat_id] = time.time() + e.retry_after + 1
             log.warning("flood wait %ss in %s", e.retry_after, chat.chat_id)

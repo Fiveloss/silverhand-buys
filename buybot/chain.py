@@ -25,14 +25,7 @@ PONS_HOOK = "0xe5e702641ea86f4ae6cc3cdaed2b886f976be044"
 POOL_MANAGER = "0x8366a39cc670b4001a1121b8f6a443a643e40951"
 NATIVE = abi.ZERO_ADDRESS
 
-# Quote assets we can value in dollars. Anything else is shown in its own
-# units with no dollar figure, because a launcher picks the pair token and a
-# fake "WETH" must not produce fake dollar amounts.
-KNOWN_QUOTES = {
-    NATIVE: ("ETH", 18, "eth"),
-    "0x0bd7d308f8e1639fab988df18a8011f41eacad73": ("WETH", 18, "eth"),
-    "0x5fc5360d0400a0fd4f2af552add042d716f1d168": ("USDG", 6, "usd"),
-}
+# The quote assets the bot can value in dollars are listed in quotes.py.
 
 # --- event topics (each equals keccak256 of the signature in its comment) ---
 # TokenLaunched(address indexed token, address indexed curve, address indexed deployer,
@@ -52,21 +45,11 @@ TOPIC_GRADUATED = "0xcdb72f157fd3666758a6ce201387ffb52038c7562e4fff352828da1096c
 #                              int128 amount1, uint160 sqrtPriceX96, uint128 liquidity,
 #                              int24 tick, uint24 fee)
 TOPIC_V4_SWAP = "0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f"
-# ERC-20 Transfer(address indexed from, address indexed to, uint256 value): a v4 buy moves
-# the token from the PoolManager to the buyer, which names the wallet the Swap does not.
+# ERC-20 Transfer(address indexed from, address indexed to, uint256 value): a pool buy moves
+# the token from the pool to the buyer, which names the wallet the Swap does not
+# (pools.payouts).
 TOPIC_TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
-
-def pool_payouts(logs: list[dict]) -> dict[tuple[str, str], str]:
-    """(token, tx) -> the wallet the PoolManager sent the token to in that transaction."""
-    out = {}
-    for lg in logs:
-        t = _topics(lg)
-        if len(t) == 3 and t[0] == TOPIC_TRANSFER and abi.topic_address(t[1]) == POOL_MANAGER:
-            to = abi.topic_address(t[2])
-            if to and to != POOL_MANAGER:
-                out[(lg["address"].lower(), lg["transactionHash"].lower())] = to
-    return out
 
 # --- selectors ---
 SEL_GET_LAUNCHED_TOKEN = "0x3cf28b5a"  # getLaunchedToken(address), on the factory

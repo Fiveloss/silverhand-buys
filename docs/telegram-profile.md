@@ -27,8 +27,8 @@ against Telegram's limits (counted in UTF-16 units):
 
 | Text | Where it shows | English |
 |---|---|---|
-| description | an empty chat with the bot, under the picture | 405 of 512 |
-| about | the bot's profile and link previews | 113 of 120 |
+| description | an empty chat with the bot, under the picture | 399 of 512 |
+| about | the bot's profile and link previews | 107 of 120 |
 
 Another language is one more key (its two-letter code) in `DESCRIPTIONS` and
 `SHORT_DESCRIPTIONS`.

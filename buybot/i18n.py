@@ -29,14 +29,6 @@ def plural(n: int, lang: str, en: tuple[str, str], ru: tuple[str, str, str]) -> 
     return en[0] if n == 1 else en[1]
 
 
-def weeks(n: int, lang: str) -> str:
-    return f"{n} " + plural(n, lang, ("week", "weeks"), ("неделя", "недели", "недель"))
-
-
-def days(n: int, lang: str) -> str:
-    return f"{n} " + plural(n, lang, ("day", "days"), ("день", "дня", "дней"))
-
-
 def t(lang: str | None, key: str, /, **kw) -> str:
     en, ru = TEXTS[key]
     s = ru if lang == "ru" else en
@@ -71,21 +63,22 @@ TEXTS: dict[str, tuple[str, str]] = {
         "👋 Thanks for adding me!\n\n"
         "I post every buy of your token here, live from Robinhood Chain.\n\n"
         "<b>Setup (admins):</b>\n"
-        "1. /track <code>0xTokenAddress</code> (a Pons v2 token)\n"
+        "1. /track <code>0xTokenAddress</code> (a Pons launch or any token with a Uniswap pool)\n"
         "2. /test to preview a post\n"
         "3. /settings to see the options · /lang <code>ru</code> for Russian\n\n"
-        "Free forever. /pro removes the ad line and adds your own GIF.\n",
+        "No ads, nothing to buy. /media (reply to a GIF, photo or video) shows it on every buy.\n",
         "👋 Спасибо, что добавили!\n\n"
         "Я публикую здесь каждую покупку вашего токена прямо из Robinhood Chain.\n\n"
         "<b>Настройка (админы):</b>\n"
-        "1. /track <code>0xАдресТокена</code> (токен Pons v2)\n"
+        "1. /track <code>0xАдресТокена</code> (запуск Pons или любой токен с пулом Uniswap)\n"
         "2. /test — пример поста\n"
         "3. /settings — настройки · /lang <code>en</code> для английского\n\n"
-        "Бесплатно навсегда. /pro убирает рекламную строку и добавляет вашу гифку.\n"),
+        "Без рекламы и без платных функций. /media (ответом на гифку, фото или видео) — "
+        "показывать её в каждом посте.\n"),
     "channel_welcome": (
         "📢 Added to <b>{title}</b>.\n\n"
         "<b>Set it up right here</b>: commands in this chat apply to that channel.\n"
-        "1. /track <code>0xTokenAddress</code> (a Pons v2 token)\n"
+        "1. /track <code>0xTokenAddress</code> (a Pons launch or any token with a Uniswap pool)\n"
         "2. /test to post a sample in the channel\n"
         "3. /settings to see the options\n\n"
         "Commands posted in the channel itself work too: I answer there and remove the "
@@ -94,7 +87,7 @@ TEXTS: dict[str, tuple[str, str]] = {
         "<code>/channel {chat_id} track 0x…</code>",
         "📢 Добавлен в <b>{title}</b>.\n\n"
         "<b>Настраивайте прямо здесь</b>: команды в этом чате применяются к каналу.\n"
-        "1. /track <code>0xАдресТокена</code> (токен Pons v2)\n"
+        "1. /track <code>0xАдресТокена</code> (запуск Pons или любой токен с пулом Uniswap)\n"
         "2. /test — пример поста в канале\n"
         "3. /settings — настройки\n\n"
         "Команды прямо в канале тоже работают: я отвечу там и через минуту удалю "
@@ -112,30 +105,32 @@ TEXTS: dict[str, tuple[str, str]] = {
         "/test — preview a post\n"
         "/settings — current settings\n"
         "/stats — buys, sells and volume of the last 24 h · /top — the biggest buyers\n"
-        "/sells <code>on</code> — post sells too (🔴), <code>off</code> to stop\n"
+        "/scan — top 10 holders, snipers, what the dev sold, copy ticker\n"
+        "/sells <code>on</code> — post sells too (🔴), <code>off</code> to stop (🚨 dev sells always show)\n"
         "/chart <code>off</code> — posts without the price chart\n"
         "/lang <code>ru</code> — posts and answers in Russian\n"
         "/minbuy <code>25</code> — skip buys under $25\n"
         "/emoji <code>🚀</code> — the mark of a buy (a sell is 🔴)\n"
         "/whale <code>1000</code> — the 🐋 mark on buys from $1,000\n"
-        "/media — reply to a GIF, photo or video to show it on every buy (Pro)\n"
-        "/pro — Pro for this chat · /untrack — stop posting\n\n"
-        "The Chart button may carry a referral code: it costs you nothing and keeps the bot free.\n",
+        "/media — reply to a GIF, photo or video to show it on every buy\n"
+        "/untrack — stop posting\n\n"
+        "The Chart button may carry a referral code; it costs you nothing.\n",
         "<b>Команды (только для админов)</b>\n"
         "/track <code>0x…</code> — публиковать покупки токена\n"
         "/test — пример поста\n"
         "/settings — текущие настройки\n"
         "/stats — покупки, продажи и объём за 24 ч · /top — крупнейшие покупатели\n"
-        "/sells <code>on</code> — публиковать и продажи (🔴), <code>off</code> — выключить\n"
+        "/scan — топ-10 держателей, снайперы, что продал дев, тикер-копия\n"
+        "/sells <code>on</code> — публиковать и продажи (🔴), <code>off</code> — выключить "
+        "(🚨 продажи дева видны всегда)\n"
         "/chart <code>off</code> — посты без графика\n"
         "/lang <code>en</code> — посты и ответы на английском\n"
         "/minbuy <code>25</code> — не публиковать покупки меньше $25\n"
         "/emoji <code>🚀</code> — значок покупки (у продажи 🔴)\n"
         "/whale <code>1000</code> — метка 🐋 у покупок от $1,000\n"
-        "/media — ответьте на гифку, фото или видео, чтобы показывать её в каждом посте (Pro)\n"
-        "/pro — Pro для этого чата · /untrack — перестать публиковать\n\n"
-        "Кнопка «Chart» может содержать реферальный код: вам это ничего не стоит, а бот остаётся "
-        "бесплатным.\n"),
+        "/media — ответьте на гифку, фото или видео, чтобы показывать её в каждом посте\n"
+        "/untrack — перестать публиковать\n\n"
+        "Кнопка «Chart» может содержать реферальный код; вам это ничего не стоит.\n"),
     "help_private": (
         "In a channel, the same commands work from this chat (they apply to your current "
         "channel, see /chats) or posted in the channel itself.",
@@ -144,19 +139,21 @@ TEXTS: dict[str, tuple[str, str]] = {
     "home": (
         "👋 I'm a <b>buy bot for Robinhood Chain</b>.\n\n"
         "Add me to your token's group or channel and I'll post every buy there in real time: "
-        "amount, buyer, market cap and a price chart, on the bonding curve and on Uniswap "
-        "after graduation.\n\n"
-        "• Free forever, with one small ad line under each post\n"
-        "• <b>Pro</b> ({plans}): no ad line, your own GIF, photo or video\n"
-        "• Sells too if you want, and stats for your token\n\n"
+        "amount, buyer, market cap and a price chart. Pons launches on the bonding curve and "
+        "after graduation, and any token with a Uniswap v2, v3 or v4 pool.\n\n"
+        "• No ads and nothing to buy: every chat gets everything\n"
+        "• Your own GIF, photo or video on every buy (/media)\n"
+        "• Sells too if you want, and stats for your token\n"
+        "• 🚨 Dev sells flagged, and /scan for holders, snipers and copy tickers\n\n"
         "Add me with a button below, then send /track <code>0xTokenAddress</code> in that chat.\n",
         "👋 Я <b>бот покупок для Robinhood Chain</b>.\n\n"
         "Добавьте меня в группу или канал токена, и я буду публиковать там каждую покупку "
-        "в реальном времени: сумму, покупателя, капитализацию и график, на бондинг-кривой "
-        "и на Uniswap после миграции.\n\n"
-        "• Бесплатно навсегда, с одной рекламной строкой под постом\n"
-        "• <b>Pro</b> ({plans}): без рекламы, своя гифка, фото или видео\n"
-        "• По желанию и продажи, а ещё статистика токена\n\n"
+        "в реальном времени: сумму, покупателя, капитализацию и график. Запуски Pons на "
+        "бондинг-кривой и после миграции, а также любой токен с пулом Uniswap v2, v3 или v4.\n\n"
+        "• Без рекламы и без платных функций: каждому чату — всё\n"
+        "• Своя гифка, фото или видео в каждом посте (/media)\n"
+        "• По желанию и продажи, а ещё статистика токена\n"
+        "• 🚨 Продажи дева отмечены, а /scan покажет держателей, снайперов и тикеры-копии\n\n"
         "Добавьте меня кнопкой ниже, затем отправьте /track <code>0xАдресТокена</code> в том чате.\n"),
 
     # ---- menu buttons
@@ -164,8 +161,6 @@ TEXTS: dict[str, tuple[str, str]] = {
     "btn_add_channel": ("📢 Add to a channel", "📢 Добавить в канал"),
     "btn_chats": ("📋 My chats", "📋 Мои чаты"),
     "btn_stats": ("📊 Stats", "📊 Статистика"),
-    "btn_pro": ("⭐ Pro", "⭐ Pro"),
-    "btn_ads": ("📣 Advertise", "📣 Реклама"),
     "btn_help": ("❓ Help", "❓ Помощь"),
     "btn_lang": ("🌐 Language", "🌐 Язык"),
     "btn_terms": ("📄 Terms", "📄 Условия"),
@@ -174,7 +169,6 @@ TEXTS: dict[str, tuple[str, str]] = {
     "btn_sells": ("🔴 Sells: {state}", "🔴 Продажи: {state}"),
     "btn_chart": ("📈 Chart: {state}", "📈 График: {state}"),
     "btn_chat_lang": ("🌐 Posts: {lang}", "🌐 Посты: {lang}"),
-    "btn_get_pro": ("⭐ Get Pro", "⭐ Купить Pro"),
     "btn_refresh": ("🔄 Refresh", "🔄 Обновить"),
     "btn_top": ("🏆 Top", "🏆 Топ"),
     "top_title": ("🏆 <b>Top buyers of {symbol}</b> · 24 h", "🏆 <b>Топ покупателей {symbol}</b> · 24 ч"),
@@ -218,8 +212,6 @@ TEXTS: dict[str, tuple[str, str]] = {
     "set_lang": ("Language: {lang} · /lang", "Язык: {lang} · /lang"),
     "set_media": ("Media: {m}", "Медиа: {m}"),
     "media_none": ("none", "нет"),
-    "set_pro": ("Plan: Pro until {date}", "Тариф: Pro до {date}"),
-    "set_free": ("Plan: Free · /pro", "Тариф: бесплатный · /pro"),
 
     # ---- actions
     "track_usage": ("Send the token's contract address: /track <code>0x…</code>",
@@ -228,6 +220,20 @@ TEXTS: dict[str, tuple[str, str]] = {
                    "⚠️ Robinhood Chain сейчас не отвечает. Попробуйте через минуту."),
     "track_v4": ("🦄 Already trading on Uniswap v4.", "🦄 Уже торгуется на Uniswap v4."),
     "track_curve": ("🎓 On the bonding curve.", "🎓 На бондинг-кривой."),
+    "track_flap": ("🎓 On its Flap.sh bonding curve.", "🎓 На бондинг-кривой Flap.sh."),
+    "venue_flap": ("Flap.sh curve", "кривая Flap.sh"),
+    "track_pools": ("🦄 Pools: {pools}", "🦄 Пулы: {pools}"),
+    "track_not_token": ("❌ This address is not a token on Robinhood Chain.",
+                        "❌ По этому адресу нет токена в Robinhood Chain."),
+    "track_quote_unreadable": ("❌ Could not read the token's quote currency. Try again in a minute.",
+                               "❌ Не удалось прочитать валюту пары токена. Попробуйте через минуту."),
+    "track_no_pools": (
+        "❌ <b>{symbol}</b> has no pool I can read yet. I follow Pons and Flap.sh launches and "
+        "pools on Uniswap v2, v3, v4 and Ramses v3 with liquidity. "
+        "Send /track again once it has one.",
+        "❌ У <b>{symbol}</b> пока нет пула, который я умею читать. Я слежу за запусками Pons и "
+        "Flap.sh и пулами Uniswap v2, v3, v4 и Ramses v3 с ликвидностью. "
+        "Отправьте /track ещё раз, когда пул появится."),
     "tracking": (
         "✅ Tracking started: posting buys of <b>{symbol}</b> ({name}).\n{venue}\n"
         "Every new buy is posted the moment it lands on the chain{sells}\n\n"
@@ -246,8 +252,6 @@ TEXTS: dict[str, tuple[str, str]] = {
                     "Использование: /emoji <code>🚀</code> (одно эмодзи или короткая комбинация)"),
     "emoji_set": ("✅ Buy mark: {v}", "✅ Значок покупки: {v}"),
     "media_removed": ("✅ Media removed.", "✅ Медиа убрано."),
-    "media_pro": ("Your own GIF, photo or video on every buy is a Pro feature. See /pro",
-                  "Своя гифка, фото или видео в каждом посте — функция Pro. См. /pro"),
     "media_usage": ("Reply with /media to a GIF, photo or video.",
                     "Ответьте командой /media на гифку, фото или видео."),
     "media_set": ("✅ Saved. Every buy post will show this {kind}. /test to preview.",
@@ -273,12 +277,6 @@ TEXTS: dict[str, tuple[str, str]] = {
     "test_failed": ("Could not post: {e}", "Не удалось опубликовать: {e}"),
     "test_sent": ("✅ Sample post sent. Real buys will look like this.",
                   "✅ Тестовый пост отправлен. Настоящие покупки будут выглядеть так же."),
-    "pro_text": ("⭐ <b>Pro</b>: no ad line and your own GIF, photo or video on every buy.\n{plans}\n\n{status}",
-                 "⭐ <b>Pro</b>: без рекламной строки и своя гифка, фото или видео в каждом посте.\n"
-                 "{plans}\n\n{status}"),
-    "pro_until": ("Pro until {date}.", "Pro до {date}."),
-    "forever": ("forever", "навсегда"),
-    "pro_free": ("This chat is on Free.", "Этот чат на бесплатном тарифе."),
 
     # ---- private chat and channels from it
     "not_in_chat": (
@@ -317,105 +315,41 @@ TEXTS: dict[str, tuple[str, str]] = {
                        "📊 Здесь пока не отслеживается токен: /track <code>0x…</code>"),
     "stats_pick": ("📊 <b>Stats</b>\n\nPick a chat in 📋 My chats first.",
                    "📊 <b>Статистика</b>\n\nСначала выберите чат в 📋 Мои чаты."),
-    "stats_usd_note": ("<i>≈ dollars at the current ETH price</i>", "<i>≈ доллары по текущему курсу ETH</i>"),
+    "stats_usd_note": ("<i>≈ dollars at the current {sym} price</i>", "<i>≈ доллары по текущему курсу {sym}</i>"),
 
-    # ---- pro, ads, terms, support
-    "pro_menu": (
-        "⭐ <b>Pro</b> for one chat: no ad line under posts and your own GIF, photo or video on "
-        "every buy. Paid with Telegram Stars; time adds up when you extend.\n\n{plans}\n\n"
-        "Send /pro in the chat, or tap below for your current chat.",
-        "⭐ <b>Pro</b> для одного чата: без рекламной строки под постами и своя гифка, фото или "
-        "видео в каждом посте. Оплата Telegram Stars; срок суммируется при продлении.\n\n{plans}\n\n"
-        "Отправьте /pro в чате или нажмите ниже для текущего чата."),
-    "pro_offer": ("⭐ <b>Pro for {title}</b>\n\n• No ad line under posts\n"
-                  "• Your own GIF, photo or video on every buy\n\nNow: {status}. Time adds up when you extend.",
-                  "⭐ <b>Pro для {title}</b>\n\n• Без рекламной строки под постами\n"
-                  "• Своя гифка, фото или видео в каждом посте\n\nСейчас: {status}. "
-                  "Срок суммируется при продлении."),
-    "pro_status_free": ("Free", "бесплатный тариф"),
-    "pro_not_in_chat": ("I'm not in that chat. Add me there first, then send /pro in it.",
-                        "Меня нет в этом чате. Сначала добавьте меня туда, затем отправьте там /pro."),
-    "offer_invalid": ("This offer is no longer valid.", "Это предложение больше не действует."),
-    "try_again": ("Something went wrong, try /pro again.", "Что-то пошло не так, попробуйте /pro ещё раз."),
-    "invoice_pro_desc": ("No ad line and your own media in {title}", "Без рекламы и своё медиа в {title}"),
-    "ads_info": (
-        "📣 <b>Advertise under every buy</b>\n\n"
-        "Your line shows under buy posts in every free chat: {chats} chats right now.\n"
-        "Price: {price} ⭐ a day, up to {max_days}. Slots run one after another, never shared.\n\n"
-        "Send:\n/advertise <code>days</code> <code>https://link</code> <code>text</code>\n"
-        "Example:\n<code>/advertise 2 https://t.me/yourtoken Join the $TOKEN community</code>\n\n"
-        "Text up to 60 characters. Each ad is reviewed first; you pay only after approval. "
-        "No promises of returns, no fake giveaways.",
-        "📣 <b>Реклама под каждой покупкой</b>\n\n"
-        "Ваша строка показывается под постами во всех бесплатных чатах: сейчас их {chats}.\n"
-        "Цена: {price} ⭐ в день, до {max_days}. Слоты идут друг за другом и не делятся.\n\n"
-        "Отправьте:\n/advertise <code>дни</code> <code>https://ссылка</code> <code>текст</code>\n"
-        "Пример:\n<code>/advertise 2 https://t.me/yourtoken Join the $TOKEN community</code>\n\n"
-        "Текст до 60 символов. Каждое объявление сначала проверяется, платите после одобрения. "
-        "Без обещаний доходности и фальшивых раздач."),
-    "ads_days": ("Days must be 1 to {n}.", "Дней должно быть от 1 до {n}."),
-    "ads_link": ("The link must start with https:// (up to 200 characters).",
-                 "Ссылка должна начинаться с https:// (до 200 символов)."),
-    "ads_text": ("The text must be 3 to 60 characters.", "Текст должен быть от 3 до 60 символов."),
-    "ads_closed": ("Ads are not open yet.", "Реклама пока не принимается."),
-    "ads_thanks": ("Thanks! Ad #{id} ({days}, {price} ⭐) is waiting for review. The invoice comes "
-                   "here once it's approved.",
-                   "Спасибо! Объявление #{id} ({days}, {price} ⭐) ждёт проверки. Счёт придёт сюда "
-                   "после одобрения."),
-    "ads_rejected": ("Ad #{id} was not approved.", "Объявление #{id} не одобрено."),
+    # ---- terms, support
     "terms": (
         "<b>Terms</b>\n\n"
-        "• The free plan posts buys with one ad line under each post.\n"
-        "• Pro ({plans}) is bought per chat with Telegram Stars. It removes the ad line and lets "
-        "admins attach their own GIF, photo or video. Time adds up when you extend.\n"
-        "• Ad slots cost {ad_price} ⭐ a day. Every ad is reviewed before you pay; we refuse ads "
-        "that look like scams or promise returns.\n"
-        "• If the bot fails to deliver what you paid for, write /paysupport and you get a refund.\n"
+        "• The bot shows no ads and sells nothing: every chat gets every feature.\n"
         "• Numbers come from Robinhood Chain as they happen. A number the bot could not read is "
         "left out, never guessed.\n"
         "• The Chart button may carry a referral code.\n"
         "• The bot never asks for keys or seed phrases. Anyone who does is not us.\n",
         "<b>Условия</b>\n\n"
-        "• Бесплатный тариф публикует покупки с одной рекламной строкой под постом.\n"
-        "• Pro ({plans}) покупается для чата за Telegram Stars. Он убирает рекламную строку и "
-        "позволяет добавить свою гифку, фото или видео. Срок суммируется при продлении.\n"
-        "• Рекламный слот стоит {ad_price} ⭐ в день. Каждое объявление проверяется до оплаты; "
-        "похожее на скам или обещающее доходность не принимаем.\n"
-        "• Если бот не выполнил оплаченное, напишите /paysupport — деньги вернутся.\n"
+        "• Бот не показывает рекламу и ничего не продаёт: каждому чату доступно всё.\n"
         "• Цифры берутся из Robinhood Chain в момент сделки. Если число не удалось прочитать, "
         "его нет в посте: мы не подставляем догадки.\n"
         "• Кнопка «Chart» может содержать реферальный код.\n"
         "• Бот никогда не просит ключи или seed-фразы. Кто просит — это не мы.\n"),
     "terms_source": ("• Source code (AGPL-3.0): {url}\n", "• Исходный код (AGPL-3.0): {url}\n"),
     "support": (
-        "🆘 <b>Payment problem?</b>\n\nSend /paysupport followed by what happened and the payment "
-        "date{contact}. If the bot did not deliver what you paid for, you get a refund.",
-        "🆘 <b>Проблема с оплатой?</b>\n\nОтправьте /paysupport и опишите, что случилось, и дату "
-        "оплаты{contact}. Если бот не выполнил оплаченное, деньги вернутся."),
+        "🆘 <b>Questions or a problem?</b>\n\nSend /support followed by what happened{contact}.",
+        "🆘 <b>Вопрос или проблема?</b>\n\nОтправьте /support и опишите, что случилось{contact}."),
     "support_contact": (" or write to {c}", " или напишите {c}"),
     "support_sent": ("Sent. You'll get an answer here.", "Отправлено. Ответ придёт сюда."),
-
-    # ---- payments
-    "pay_currency": ("Unsupported currency.", "Эта валюта не поддерживается."),
-    "pay_invalid": ("This invoice is invalid.", "Этот счёт недействителен."),
-    "pay_left": ("The bot is no longer in that chat.", "Бота больше нет в этом чате."),
-    "pay_prices": ("Prices changed. Please open /pro again.", "Цены изменились. Откройте /pro ещё раз."),
-    "pay_ad_invalid": ("This ad invoice is no longer valid.", "Этот счёт за рекламу больше не действует."),
-    "pro_paid": ("⭐ Pro is on for {title} until {date}.\nTo add a GIF: reply to it with /media in the chat.",
-                 "⭐ Pro включён для {title} до {date}.\nЧтобы добавить гифку: ответьте на неё /media в чате."),
-    "pro_paid_chat": ("⭐ This chat is now Pro. Thank you!", "⭐ Теперь у этого чата Pro. Спасибо!"),
-    "ad_paid": ("📣 Paid. Your ad runs {starts} → {ends}.", "📣 Оплачено. Реклама идёт {starts} → {ends}."),
+    "support_failed": ("Couldn't deliver it right now. Please try again later.",
+                       "Не удалось доставить. Попробуйте позже."),
+    "support_wait": ("You just wrote to us. Please wait {m} min before the next message.",
+                     "Вы только что писали. Подождите {m} мин до следующего сообщения."),
 
     # ---- posts
     "post_test": ("🧪 <b>TEST POST</b> · sample numbers", "🧪 <b>ТЕСТОВЫЙ ПОСТ</b> · примерные цифры"),
     "post_buy": ("Buy!", "Покупка!"),
+    "post_buy_tag": ("BUY", "ПОКУПКА"),
+    "post_sell_tag": ("SELL", "ПРОДАЖА"),
     "post_sell": ("Sell!", "Продажа!"),
-    "post_spent": ("💵 Spent", "💵 Потрачено"),
     "post_got": ("🪙 Got", "🪙 Получено"),
     "post_sold": ("🪙 Sold", "🪙 Продано"),
-    "post_received": ("💰 Got", "💰 Получено"),
-    "post_buyer": ("👤 Buyer", "👤 Покупатель"),
-    "post_seller": ("👤 Seller", "👤 Продавец"),
     "post_curve": ("🎓 Curve", "🎓 Кривая"),
     "post_new_holder": ("🆕 New holder", "🆕 Новый держатель"),
     "post_whale": ("WHALE", "КИТ"),
@@ -432,29 +366,26 @@ TEXTS: dict[str, tuple[str, str]] = {
     "whale_off": ("✅ The 🐋 mark is off.", "✅ Метка 🐋 выключена."),
     "set_whale": ("Whale mark: from {v} · /whale", "Метка кита: от {v} · /whale"),
     "post_sold_all": ("🚪 Sold the whole bag", "🚪 Продал всё"),
-    "post_position": ("💼 Position {change} · holds {share}", "💼 Позиция {change} · держит {share}"),
+    "post_dev_sell_tag": ("DEV SELL", "ДЕВ ПРОДАЁТ"),
+    "post_dev_sold": ("🚨 sold {pct} of the bag · holds {share}", "🚨 продал {pct} своей позиции · держит {share}"),
+    "post_position": ("💼 {change} · holds {share}", "💼 {change} · держит {share}"),
     "post_more": ("➕ {n} more {word}", "➕ ещё {n} {word}"),
     "post_grad": (
         "🎓🎓🎓\n<b>{symbol} graduated!</b>\n\nThe bonding curve is full ({raised} raised). "
-        "Trading moves to Uniswap v4, and buys there keep showing up here.",
+        "Trading moves to {dex}, and buys there keep showing up here.",
         "🎓🎓🎓\n<b>{symbol} вышел с кривой!</b>\n\nБондинг-кривая заполнена (собрано {raised}). "
-        "Торги переходят на Uniswap v4, и покупки оттуда тоже будут здесь."),
-    "footer_ad": ("<i>Ad:</i>", "<i>Реклама:</i>"),
-    "footer_advertise": ("Advertise here", "Реклама здесь"),
-    "footer_free": ("Free buy alerts for your chat", "Бесплатные уведомления о покупках для вашего чата"),
+        "Торги переходят на {dex}, и покупки оттуда тоже будут здесь."),
 
     # ---- the owner's control panel
     "btn_panel": ("🛠 Control panel", "🛠 Панель управления"),
     "adm_title": ("🛠 <b>Control panel</b>", "🛠 <b>Панель управления</b>"),
     "adm_summary": (
-        "💬 Chats: <b>{active}</b> active · {tracking} tracking · ⭐ {pro} Pro\n"
+        "💬 Chats: <b>{active}</b> active · {tracking} tracking\n"
         "🪙 Tokens tracked: {tokens} · queue {outbox}\n"
-        "💰 Stars received: <b>{stars} ⭐</b> · 📣 ads to review: {ads}\n"
         "👤 Users: {users}\n"
         "{watcher}",
-        "💬 Чатов: <b>{active}</b> активных · {tracking} с токеном · ⭐ {pro} с Pro\n"
+        "💬 Чатов: <b>{active}</b> активных · {tracking} с токеном\n"
         "🪙 Токенов отслеживается: {tokens} · очередь {outbox}\n"
-        "💰 Получено Stars: <b>{stars} ⭐</b> · 📣 объявлений на проверке: {ads}\n"
         "👤 Пользователей: {users}\n"
         "{watcher}"),
     "adm_health": ("🧠 Memory {mb} MB of 300 · up {up} h · 💾 last backup {backup}",
@@ -462,33 +393,19 @@ TEXTS: dict[str, tuple[str, str]] = {
     "adm_watch_ok": ("🟢 Chain read {s} s ago · block lag {lag}",
                      "🟢 Сеть прочитана {s} с назад · отставание {lag} бл."),
     "adm_watch_bad": ("⚠️ Chain not read for {m} min: {err}", "⚠️ Сеть не читается {m} мин: {err}"),
-    "adm_btn_pro": ("⭐ Pro chats", "⭐ Чаты с Pro"),
     "adm_btn_chats": ("💬 All chats", "💬 Все чаты"),
-    "adm_btn_ads": ("📣 Ads", "📣 Реклама"),
-    "adm_btn_pay": ("💰 Payments", "💰 Платежи"),
     "adm_btn_back": ("← Panel", "← Панель"),
-    "adm_pro_title": ("⭐ <b>Chats with Pro</b> ({n})", "⭐ <b>Чаты с Pro</b> ({n})"),
     "adm_chats_title": ("💬 <b>All chats</b> ({n}) · page {page}", "💬 <b>Все чаты</b> ({n}) · стр. {page}"),
     "adm_none": ("Nothing here yet.", "Пока пусто."),
-    "adm_chat_hint": ("Tap a chat to manage its Pro.", "Нажмите на чат, чтобы управлять его Pro."),
+    "adm_chat_hint": ("Tap a chat to see its details.", "Нажмите на чат, чтобы посмотреть подробности."),
     "adm_chat": (
         "{kind} <b>{title}</b>\n<code>{chat_id}</code>\n\n"
         "Added by: {added_by}\nToken: {token}\nLanguage: {lang} · sells {sells} · chart {chart}\n"
-        "Posted: today {d} · 7 days {w} · all time {a}\n\n⭐ <b>{pro}</b>",
+        "Posted: today {d} · 7 days {w} · all time {a}",
         "{kind} <b>{title}</b>\n<code>{chat_id}</code>\n\n"
         "Добавил: {added_by}\nТокен: {token}\nЯзык: {lang} · продажи {sells} · график {chart}\n"
-        "Опубликовано: сегодня {d} · 7 дней {w} · всего {a}\n\n⭐ <b>{pro}</b>"),
+        "Опубликовано: сегодня {d} · 7 дней {w} · всего {a}"),
     "adm_unknown": ("unknown", "неизвестно"),
-    "adm_pro_on": ("Pro until {date}", "Pro до {date}"),
-    "adm_pro_off": ("Free plan", "Бесплатный тариф"),
-    "adm_btn_days": ("⭐ +{n} d", "⭐ +{n} дн."),
-    "adm_btn_forever": ("♾ Pro forever", "♾ Pro навсегда"),
-    "adm_btn_revoke": ("❌ Remove Pro", "❌ Снять Pro"),
-    "adm_granted": ("✅ Pro until {date}", "✅ Pro до {date}"),
-    "adm_revoked": ("✅ Pro removed", "✅ Pro снят"),
-    "adm_ads_title": ("📣 <b>Ads</b>", "📣 <b>Реклама</b>"),
-    "adm_pay_title": ("💰 <b>Last payments</b> · total {total} ⭐", "💰 <b>Последние платежи</b> · всего {total} ⭐"),
-    "adm_refunded": ("refunded", "возвращён"),
     "adm_not_owner": ("This is for the bot's owner.", "Это только для владельца бота."),
 
     # ---- the 📊 24h pop-up under posts (plain text, at most 200 characters)
@@ -497,4 +414,52 @@ TEXTS: dict[str, tuple[str, str]] = {
             "{symbol} · за {h} ч\n🟢 {buys} {bw} · {bv}\n🔴 {sells} {sw} · {sv}\n"
             "📊 MC {mc} · {change}\n⬆ {hi} · ⬇ {lo}"),
     "pop_none": ("{symbol}: no trades in the last hours yet.", "{symbol}: за последние часы сделок пока нет."),
+
+    # ---- /scan and the 🛡 Scan button
+    "btn_scan": ("🛡 Scan", "🛡 Скан"),
+    "scan_usage": ("Send a token's contract address: /scan <code>0x…</code>",
+                   "Отправьте адрес контракта токена: /scan <code>0x…</code>"),
+    "scan_not_token": ("❌ That address is not a token.", "❌ По этому адресу нет токена."),
+    "scan_no_history": ("❌ No mint of this token found on Robinhood Chain.",
+                        "❌ Выпуск этого токена в Robinhood Chain не найден."),
+    "scan_wait": ("⏳ One scan a minute, please: try again in {s} s.",
+                  "⏳ Не чаще одного скана в минуту: попробуйте через {s} с."),
+    "scan_title": ("🛡 <b>Scan · ${symbol}</b> · {name}", "🛡 <b>Скан · ${symbol}</b> · {name}"),
+    "scan_top": ("👑 Top 10 wallets hold <b>{share}</b> of the supply",
+                 "👑 У топ-10 кошельков <b>{share}</b> от выпуска"),
+    "scan_top_list": ("   biggest: {list}", "   крупнейшие: {list}"),
+    "scan_holders": ("👥 Holders: <b>{n}</b>", "👥 Держателей: <b>{n}</b>"),
+    "scan_snipers": ("🎯 Snipers: <b>{n}</b> {word} bought in the first {s} s",
+                     "🎯 Снайперы: <b>{n}</b> {word} купили в первые {s} с"),
+    "scan_snipers_hold": (" · hold <b>{share}</b> now", " · сейчас у них <b>{share}</b>"),
+    "scan_no_snipers": ("🎯 Snipers: none in the first {s} s", "🎯 Снайперы: в первые {s} с никого"),
+    "scan_no_market": ("🎯 Snipers: no market opened for it yet", "🎯 Снайперы: рынка у токена ещё нет"),
+    "scan_dev": ("👨‍💻 Dev {who}", "👨‍💻 Дев {who}"),
+    "scan_dev_holds": ("holds <b>{share}</b>", "держит <b>{share}</b>"),
+    "scan_dev_sold": ("🚨 sold <b>{pct}</b> of what they got", "🚨 продал <b>{pct}</b> полученного"),
+    "scan_dev_kept": ("has not sold", "не продавал"),
+    "scan_dev_moved": ("sent {pct} to other wallets", "переслал {pct} на другие кошельки"),
+    "scan_dev_unknown": ("👨‍💻 Dev: unknown", "👨‍💻 Дев: неизвестен"),
+    "scan_sellers": ("🔁 Wallets that sold: <b>{n}</b>", "🔁 Кошельков, которые продавали: <b>{n}</b>"),
+    "scan_copy": ("⚠️ <b>Copy ticker</b>: an older token is also ${symbol}: {who}",
+                  "⚠️ <b>Тикер-копия</b>: ${symbol} — это и тикер более старого токена: {who}"),
+    "scan_no_copy": ("✅ Ticker: no older ${symbol} among the tokens I know",
+                     "✅ Тикер: среди известных мне токенов нет более старого ${symbol}"),
+    "scan_partial": ("⏳ Over {n} transfers: holders and the dev's sales were not counted.",
+                     "⏳ Больше {n} переводов: держателей и продажи дева не считал."),
+    "scan_footer": ("<i>Not checked: whether it can be sold (honeypot), which needs a simulated sale. "
+                    "From the chain's Transfer logs, as of a minute ago.</i>",
+                    "<i>Не проверено, можно ли его продать (honeypot): для этого нужна симуляция продажи. "
+                    "По Transfer-логам сети, на минуту назад.</i>"),
+    "pop_scan": ("🛡 ${symbol}\n{lines}\nHoneypot not checked", "🛡 ${symbol}\n{lines}\nHoneypot не проверялся"),
+    "pop_scan_top": ("Top 10: {share}", "Топ-10: {share}"),
+    "pop_scan_snipers": ("Snipers: {n}{hold}", "Снайперы: {n}{hold}"),
+    "pop_scan_hold": (", hold {share}", ", у них {share}"),
+    "pop_scan_dev": ("Dev: holds {share}{sold}", "Дев: держит {share}{sold}"),
+    "pop_scan_dev_sold": (", sold {pct}", ", продал {pct}"),
+    "pop_scan_copy": ("⚠ Copy of an older ${symbol}", "⚠ Копия более старого ${symbol}"),
+    "pop_scan_running": ("🛡 Scanning ${symbol}… Tap again in about 20 s.",
+                         "🛡 Сканирую ${symbol}… Нажмите ещё раз секунд через 20."),
+    "pop_scan_failed": ("🛡 The chain did not answer. Try again in a minute.",
+                        "🛡 Сеть не ответила. Попробуйте через минуту."),
 }

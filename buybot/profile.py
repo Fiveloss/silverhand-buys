@@ -15,9 +15,9 @@ DESCRIPTIONS = {
         "⚡ Every buy of your token, posted in your chat the moment it lands on Robinhood Chain.\n"
         "\n"
         "💵 Amount, buyer and market cap\n"
-        "🎓 Bonding-curve progress, then Uniswap v4 after graduation\n"
+        "🎓 Pons curves, then any Uniswap v2/v3/v4 pool\n"
         "🧹 No spam: bursts merge into one post\n"
-        "⭐ Pro: no ad line, your own GIF\n"
+        "🖼 Your own GIF in every post · no ads\n"
         "\n"
         "Start: add me to your group, then send /track 0xTokenAddress\n"
         "\n"
@@ -28,9 +28,9 @@ DESCRIPTIONS = {
         "⚡ Каждая покупка вашего токена — в вашем чате, как только она прошла в Robinhood Chain.\n"
         "\n"
         "💵 Сумма, покупатель и капитализация\n"
-        "🎓 Прогресс бондинг-кривой, после миграции — Uniswap v4\n"
+        "🎓 Кривые Pons и любые пулы Uniswap v2/v3/v4\n"
         "🧹 Без спама: серия покупок — один пост\n"
-        "⭐ Pro: без рекламной строки, своя гифка\n"
+        "🖼 Своя гифка в каждом посте · без рекламы\n"
         "\n"
         "Старт: добавьте меня в группу и отправьте /track 0xАдресТокена\n"
         "\n"
@@ -39,9 +39,9 @@ DESCRIPTIONS = {
     ),
 }
 SHORT_DESCRIPTIONS = {
-    None: "Every buy of your token, live in your chat. Robinhood Chain. Free forever. "
+    None: "Every buy of your token, live in your chat. Robinhood Chain. No ads. "
           "Not affiliated with Robinhood or Pons.",
-    "ru": "Каждая покупка вашего токена — сразу в вашем чате. Robinhood Chain. Бесплатно. "
+    "ru": "Каждая покупка вашего токена — сразу в вашем чате. Robinhood Chain. Без рекламы. "
           "Не связан с Robinhood и Pons.",
 }
 

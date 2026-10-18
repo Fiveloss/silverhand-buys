@@ -1,11 +1,12 @@
-"""Telegram handlers: group and channel setup, the private chat's menu, Stars
-payments, owner tools.
+"""Telegram handlers: group and channel setup, the private chat's menu, owner tools.
 
 The bot only needs commands, so it works with privacy mode ON: it never reads
 a group's conversation. Settings commands are for chat admins; in a channel
 every post comes from an admin. A channel is set up either with commands posted
 in it or from the private chat, where commands apply to the person's current
 chat (picked in /chats). Every command gets an answer saying what was done.
+
+Every chat gets everything: no ads, no paid plan, nothing for sale.
 
 Languages: a person's language is chosen on the first /start and changed with
 /lang; a chat's language (/lang in the chat) sets its posts and the answers
@@ -18,7 +19,6 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 
@@ -28,13 +28,14 @@ from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import (JOIN_TRANSITION, LEAVE_TRANSITION, ChatMemberUpdatedFilter, Command,
                              CommandObject, CommandStart)
 from aiogram.types import (CallbackQuery, ChatMemberUpdated, FSInputFile, InlineKeyboardButton,
-                           InlineKeyboardMarkup, InputMediaAnimation, LabeledPrice, Message,
-                           PreCheckoutQuery, User)
+                           InlineKeyboardMarkup, InputMediaAnimation, Message, User)
 
-from . import abi, i18n, render
+from . import abi, emoji, heavy, i18n, render
+from . import scan as scanner
 from .config import Config
 from .db import Chat, Db
 from .i18n import t
+from .quotes import Rates
 from .sender import CHART_ANIMATED, CHART_OFF, CHART_STILL, make_chart, send_post, wants_chart
 from .stats import token_day
 from .tokens import TokenError, load_token, read_curve_constants
@@ -45,7 +46,8 @@ GROUPS = {ChatType.GROUP, ChatType.SUPERGROUP}
 MENU_DIR = Path(__file__).resolve().parent.parent / "assets" / "menu"
 CAPTION_MAX = 1024
 ADMINS = (ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR)
-FOREVER = 4_102_444_800  # 2100-01-01: Pro that does not run out
+SUPPORT_COOLDOWN = 600  # seconds between two /support messages of one person
+SCAN_COOLDOWN = 60      # seconds between two /scan of new tokens by one person in the private chat
 
 
 @dataclass
@@ -60,15 +62,15 @@ class App:
     started: float = field(default_factory=time.time)
     note_ttl: float = 60.0  # seconds a command and its answer stay in a channel
     tasks: set = field(default_factory=set)
+    rates: object = None    # quotes.Rates: dollars per unit of each quote
+    support_at: dict = field(default_factory=dict)  # user id -> time of their last /support
+    scans: dict = field(default_factory=dict)       # token -> its last scan.Scan, kept SCAN_TTL
+    scanning: set = field(default_factory=set)      # tokens being scanned right now
+    scan_at: dict = field(default_factory=dict)     # user id -> time of their last fresh /scan
 
-
-def _date(ts: float) -> str:
-    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-
-def until(ts: float, lang: str) -> str:
-    """When Pro ends, or "forever"."""
-    return t(lang, "forever") if ts >= FOREVER else _date(ts)
+    def __post_init__(self):
+        if self.rates is None:
+            self.rates = Rates(self.rpc, self.eth_usd)
 
 
 def url_btn(text: str, url: str) -> InlineKeyboardButton:
@@ -81,15 +83,6 @@ def cb_btn(text: str, data: str) -> InlineKeyboardButton:
 
 def kb(*rows: list[InlineKeyboardButton]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[list(r) for r in rows if r])
-
-
-def _kb(rows: list[list[tuple[str, str]]], callback: bool = False) -> InlineKeyboardMarkup:
-    make = cb_btn if callback else url_btn
-    return kb(*[[make(a, b) for a, b in row] for row in rows])
-
-
-def plans_text(cfg: Config, lang: str) -> str:
-    return " · ".join(f"{i18n.weeks(w, lang)}: {s} ⭐" for w, s in sorted(cfg.pro_plans.items()))
 
 
 def plain_len(html: str) -> int:
@@ -135,12 +128,19 @@ def is_owner(app: App, user_id: int | None) -> bool:
     return user_id is not None and user_id in app.cfg.owner_ids
 
 
-async def notify_owners(bot: Bot, app: App, text: str, markup=None) -> None:
+async def notify_owners(bot: Bot, app: App, text: str, markup=None) -> int:
+    """Message every owner; returns how many got it."""
+    sent = 0
     for uid in app.cfg.owner_ids:
         try:
             await bot.send_message(uid, text, reply_markup=markup)
+            sent += 1
         except TelegramAPIError as e:
             log.warning("cannot message owner %s: %s", uid, e)
+    return sent
+
+
+SUPPORT_HEAD = "🆘 /support from "  # an owner's reply to a message starting so goes back to its sender
 
 
 # --------------------------------------------------------------------------- texts
@@ -156,13 +156,12 @@ def chat_title(chat: Chat) -> str:
 
 
 def home_text(app: App, lang: str) -> str:
-    return t(lang, "home", plans=plans_text(app.cfg, lang)) + "\n" + t(lang, "not_affiliated")
+    return t(lang, "home") + "\n" + t(lang, "not_affiliated")
 
 
 def terms_text(app: App, lang: str) -> str:
     source = t(lang, "terms_source", url=escape(app.cfg.source_url)) if app.cfg.source_url else ""
-    return (t(lang, "terms", plans=plans_text(app.cfg, lang), ad_price=app.cfg.ad_day_stars)
-            + source + "\n" + t(lang, "not_affiliated"))
+    return t(lang, "terms") + source + "\n" + t(lang, "not_affiliated")
 
 
 def support_text(app: App, lang: str) -> str:
@@ -170,14 +169,21 @@ def support_text(app: App, lang: str) -> str:
     return t(lang, "support", contact=contact)
 
 
-def ads_text(app: App, lang: str) -> str:
-    return t(lang, "ads_info", chats=app.db.stats()["chats_tracking"], price=app.cfg.ad_day_stars,
-             max_days=i18n.days(app.cfg.ad_max_days, lang))
-
-
 def help_text(lang: str, private: bool = False) -> str:
     return (t(lang, "group_help") + ("\n" + t(lang, "help_private") + "\n" if private else "")
             + t(lang, "not_affiliated"))
+
+
+def pools_line(pools: list, with_liquidity: bool = True, limit: int = 3) -> str:
+    """Uniswap v3 · WETH ($1.2M), Uniswap v4 · USDG ($310K) +2"""
+    parts = []
+    for p in pools[:limit]:
+        part = f"{escape(p.dex)} · {escape(p.quote_symbol)}"
+        if with_liquidity and p.liquidity_usd:
+            part += f" ({render.fmt_usd(p.liquidity_usd)})"
+        parts.append(part)
+    more = f" +{len(pools) - limit}" if len(pools) > limit else ""
+    return ", ".join(parts) + more
 
 
 def settings_text(app: App, chat_id: int, lang: str) -> str:
@@ -185,7 +191,12 @@ def settings_text(app: App, chat_id: int, lang: str) -> str:
     token = app.db.get_token(chat.token) if chat.token else None
     lines = [t(lang, "settings_title")]
     if token:
-        venue = t(lang, "venue_v4" if token.graduated else "venue_curve")
+        if token.kind == "dex":
+            venue = pools_line(app.db.pools_of(token.address), with_liquidity=False)
+        elif token.kind == "flap":
+            venue = t(lang, "venue_flap")
+        else:
+            venue = t(lang, "venue_v4" if token.graduated else "venue_curve")
         lines.append(t(lang, "set_token", symbol=escape(token.symbol), address=token.address, venue=venue))
         w = app.watcher
         if w is not None:
@@ -202,9 +213,7 @@ def settings_text(app: App, chat_id: int, lang: str) -> str:
     lines.append(t(lang, "set_sells_on" if chat.sells else "set_sells_off"))
     lines.append(t(lang, {0: "set_chart_off", 2: "set_chart_still"}.get(chat.chart, "set_chart_on")))
     lines.append(t(lang, "set_lang", lang=i18n.LANG_NAMES[i18n.norm(chat.lang)]))
-    lines.append(t(lang, "set_media", m=chat.media_kind or t(lang, "media_none"))
-                 + ("" if chat.is_pro() else " (Pro)"))
-    lines.append(t(lang, "set_pro", date=until(chat.pro_until, lang)) if chat.is_pro() else t(lang, "set_free"))
+    lines.append(t(lang, "set_media", m=chat.media_kind or t(lang, "media_none")))
     return "\n".join(lines)
 
 
@@ -215,11 +224,7 @@ async def stats_text(app: App, chat: Chat, lang: str) -> str:
     now = time.time()
     supply = token.total_supply / 10 ** token.decimals
     day = token_day(app.db.trades_since(token.address, int(now - 86400)), supply, now)
-    rate = None
-    if token.quote_kind == "usd":
-        rate = 1.0
-    elif token.quote_kind == "eth":
-        rate = await app.eth_usd.get()
+    rate = await app.rates.get(token.quote_kind)
     sym = escape(token.quote_symbol)
 
     def money(q: float) -> str:
@@ -248,8 +253,8 @@ async def stats_text(app: App, chat: Chat, lang: str) -> str:
             lines.append(t(lang, "stats_whale", v=money(day.biggest_buy)))
     posted = app.db.chat_posted(chat.chat_id)
     lines += ["", t(lang, "stats_posted", d=posted["today"], w=posted["week"], a=posted["all"])]
-    if rate and token.quote_kind == "eth":
-        lines.append(t(lang, "stats_usd_note"))
+    if rate and token.quote_kind != "usd":
+        lines.append(t(lang, "stats_usd_note", sym=sym))
     return "\n".join(lines)
 
 
@@ -261,7 +266,7 @@ async def top_text(app: App, chat: Chat, lang: str) -> str:
     rows, wallets = app.db.top_buyers(token.address, int(time.time() - 86400))
     if not rows:
         return t(lang, "top_none", symbol=escape(token.symbol))
-    rate = 1.0 if token.quote_kind == "usd" else (await app.eth_usd.get() if token.quote_kind == "eth" else None)
+    rate = await app.rates.get(token.quote_kind)
     medals = ["🥇", "🥈", "🥉"]
     lines = [t(lang, "top_title", symbol=escape(token.symbol)), ""]
     for n, (wallet, quote, count) in enumerate(rows):
@@ -284,7 +289,7 @@ async def popup_text(app: App, token, lang: str) -> str:
     day = token_day(app.db.trades_since(token.address, int(now - 86400)), supply, now)
     if day is None:
         return t(lang, "pop_none", symbol=token.symbol)[:200]
-    rate = 1.0 if token.quote_kind == "usd" else (await app.eth_usd.get() if token.quote_kind == "eth" else None)
+    rate = await app.rates.get(token.quote_kind)
 
     def money(q: float) -> str:
         return render.fmt_usd(q * rate) if rate else f"{render.fmt_num(q)} {token.quote_symbol}"
@@ -299,24 +304,71 @@ async def popup_text(app: App, token, lang: str) -> str:
     return text[:200]
 
 
+def cached_scan(app: App, address: str):
+    s = app.scans.get(address.lower())
+    return s if s and time.time() - s.at < scanner.SCAN_TTL else None
+
+
+async def get_scan(app: App, address: str):
+    """A token's scan: the kept one while fresh, else a new one. One scan runs at a time
+    (alongside no history backfill: both walk logs), and the copy-ticker check uses the
+    tokens the bot knows."""
+    address = address.lower()
+    if cached_scan(app, address):
+        return cached_scan(app, address)
+    app.scanning.add(address)
+    try:
+        async with heavy.backfill():
+            if cached_scan(app, address):  # another request finished it meanwhile
+                return cached_scan(app, address)
+            head = app.watcher.head if app.watcher is not None and app.watcher.head else \
+                await app.rpc.block_number()
+            s = await scanner.scan(app.rpc, address, head, token=app.db.get_token(address))
+            s.copies = scanner.find_copies(s.symbol, s.token, s.made_ts, scanner.known_tokens(app.db, s.symbol))
+    finally:
+        app.scanning.discard(address)
+    for old in [a for a, v in app.scans.items() if time.time() - v.at >= scanner.SCAN_TTL]:
+        del app.scans[old]
+    app.scans[address] = s
+    return s
+
+
+async def scan_answer(app: App, address: str, lang: str) -> str:
+    """The /scan reply for a token, or why there is none."""
+    try:
+        s = await get_scan(app, address)
+    except scanner.ScanError as e:
+        return t(lang, e.key)
+    except Exception as e:
+        log.warning("scan of %s failed: %s", address, e)
+        return t(lang, "chain_down")
+    return render.scan_text(s, lang, app.cfg.explorer_url)
+
+
 # --------------------------------------------------------------------------- router
 
 def adopt(app: App, chat_id: int, user_id: int) -> None:
-    """Record who manages a chat. The bot owner's own chats get Pro for good."""
+    """Record who manages a chat."""
     app.db.update_chat(chat_id, added_by=user_id)
-    if is_owner(app, user_id) and app.db.get_chat(chat_id).pro_until < FOREVER:
-        app.db.set_pro_until(chat_id, FOREVER)
 
 
 async def claim_for_owners(bot: Bot, app: App) -> None:
     """On start: chats joined before the bot recorded who added it, where an owner
-    is an admin, become the owner's (and so Pro)."""
+    is an admin, become the owner's."""
     for c in app.db.unclaimed_chats():
         for uid in app.cfg.owner_ids:
             if await is_chat_admin(bot, c.chat_id, uid):
                 adopt(app, c.chat_id, uid)
                 log.info("chat %s (%s) claimed for owner %s", c.chat_id, c.title, uid)
                 break
+
+
+def track_venue(app: App, token, lang: str) -> str:
+    if token.kind == "dex":
+        return t(lang, "track_pools", pools=pools_line(app.db.pools_of(token.address)))
+    if token.kind == "flap":
+        return t(lang, "track_flap")
+    return t(lang, "track_v4" if token.graduated else "track_curve")
 
 
 def build_router(app: App) -> Router:
@@ -335,13 +387,17 @@ def build_router(app: App) -> Router:
             app.db.upsert_token(token)
         if token is None:
             try:
-                token = await load_token(app.rpc, address)
+                token, found = await load_token(app.rpc, address, app.rates)
             except TokenError as e:
+                if e.key:
+                    return t(lang, e.key, **{k: escape(str(v)) for k, v in e.kw.items()}), None
                 return f"❌ {escape(str(e))}", None
             except Exception:
                 log.exception("load_token %s failed", address)
                 return t(lang, "chain_down"), None
             app.db.upsert_token(token)
+            if found:
+                app.db.set_pools(token.address, found)
         app.db.update_chat(chat_id, token=token.address)
         if app.watcher is not None and app.watcher.needs_backfill(token):
             # the first chart and /stats need history: load the last day in the background
@@ -349,7 +405,7 @@ def build_router(app: App) -> Router:
         app.db.clear_chat_outbox(chat_id)
         chat = app.db.get_chat(chat_id)
         return t(lang, "tracking", symbol=escape(token.symbol), name=escape(token.name),
-                 venue=t(lang, "track_v4" if token.graduated else "track_curve"),
+                 venue=track_venue(app, token, lang),
                  sells=t(lang, "tracking_sells_on" if chat.sells else "tracking_sells_off"),
                  minbuy=render.fmt_usd(chat.min_usd)), None
 
@@ -388,12 +444,9 @@ def build_router(app: App) -> Router:
         return t(lang, "emoji_set", v=value), None
 
     async def act_media(bot, chat_id, args, reply_to, lang):
-        chat = app.db.get_chat(chat_id)
         if args and args[0].lower() == "off":
             app.db.update_chat(chat_id, media_kind=None, media_file_id=None)
             return t(lang, "media_removed"), None
-        if not chat.is_pro():
-            return t(lang, "media_pro"), None
         kind = file_id = None
         if reply_to and reply_to.animation:
             kind, file_id = "animation", reply_to.animation.file_id
@@ -450,40 +503,46 @@ def build_router(app: App) -> Router:
         token = app.db.get_token(chat.token) if chat.token else None
         if not token:
             return t(lang, "test_first"), None
-        eth_usd = await app.eth_usd.get() if token.quote_kind == "eth" else None
-        p = render.sample_payload(token.symbol, token.quote_symbol, eth_usd)
+        rate = await app.rates.get(token.quote_kind)
+        top = app.db.pools_of(token.address)[:1] if token.kind == "dex" else []
+        venue = top[0].venue if top else ("v4" if token.graduated else "curve")
+        p = render.sample_payload(token.symbol, token.quote_symbol, rate, venue=venue,
+                                  dex=top[0].dex if top else None)
         p["token"] = token.address
         text = render.buy_text(p, chat, explorer=app.cfg.explorer_url, test=True)
-        text += render.footer(chat.is_pro(), None if chat.is_pro() else app.db.current_ad(),
-                              app.username, lang=chat.lang)
+        text += render.footer()
         try:
             if wants_chart(chat, True) and app.watcher is not None \
                     and app.db.last_trade_ts(token.address) is None:
                 try:  # right after /track the history may still be loading
-                    await asyncio.wait_for(app.watcher.backfill(token), 20)
+                    await asyncio.wait_for(app.watcher.backfill(token), 8)
                 except Exception as e:
                     log.info("no history for the test chart of %s: %s", token.symbol, e)
-            chart = (await make_chart(app.db, p, 1, mode=chat.chart, lang=chat.lang)
+            chart = (await make_chart(app.db, p, 1, mode=chat.chart, lang=chat.lang, whale_usd=chat.whale_usd)
                      if wants_chart(chat, True) else None)
-            await send_post(bot, chat, text, render.buttons(p, app.cfg.trade_url, ""), True, chart)
+            await send_post(bot, chat, text, render.buttons(p, app.cfg.trade_url, ""), True, chart,
+                            emoji.load(app.db))
         except TelegramAPIError as e:
             return t(lang, "test_failed", e=escape(str(e))), None
         return None, None
 
-    async def act_pro(bot, chat_id, args, reply_to, lang):
-        chat = app.db.get_chat(chat_id)
-        status = t(lang, "pro_until", date=until(chat.pro_until, lang)) if chat.is_pro() else t(lang, "pro_free")
-        url = f"https://t.me/{app.username}?start=pro_{chat_id}"
-        return (t(lang, "pro_text", plans=plans_text(app.cfg, lang), status=status),
-                _kb([[(t(lang, "btn_get_pro"), url)]]))
-
     async def act_help(bot, chat_id, args, reply_to, lang):
         return help_text(lang), None
+
+    async def act_scan(bot, chat_id, args, reply_to, lang):
+        """/scan 0x…, or /scan alone for the chat's own token."""
+        if args and abi.is_address(args[0]):
+            address = args[0]
+        else:
+            address = app.db.get_chat(chat_id).token if not args else None
+        if not address:
+            return t(lang, "scan_usage"), None
+        return await scan_answer(app, address, lang), None
 
     actions = {"track": act_track, "untrack": act_untrack, "minbuy": act_minbuy,
                "emoji": act_emoji, "whale": act_whale, "media": act_media, "sells": act_sells,
                "chart": act_chart, "lang": act_lang, "stats": act_stats, "top": act_top,
-               "settings": act_settings, "test": act_test, "pro": act_pro, "help": act_help}
+               "settings": act_settings, "test": act_test, "help": act_help, "scan": act_scan}
 
     def spawn(coro):
         task = asyncio.create_task(coro)
@@ -692,7 +751,6 @@ def build_router(app: App) -> Router:
                    url_btn(t(lang, "btn_add_channel"),
                            f"https://t.me/{app.username}?startchannel=true&admin=post_messages")],
                   [cb_btn(t(lang, "btn_chats"), "m:chats"), cb_btn(t(lang, "btn_stats"), "m:stats")],
-                  [cb_btn(t(lang, "btn_pro"), "m:pro"), cb_btn(t(lang, "btn_ads"), "m:ads")],
                   [cb_btn(t(lang, "btn_help"), "m:help"), cb_btn(t(lang, "btn_lang"), "m:lang")],
                   [cb_btn(t(lang, "btn_terms"), "m:terms"), cb_btn(t(lang, "btn_support"), "m:support")])
 
@@ -721,8 +779,6 @@ def build_router(app: App) -> Router:
                     marks.append("🔴")
                 if c.chart:
                     marks.append("📈")
-                if c.is_pro():
-                    marks.append("⭐")
                 pick = "▶️ " if c.chat_id == current else ""
                 lines.append(pick + t(lang, "chat_line", kind=kind_icon(c), title=chat_title(c),
                                       token=" · ".join(marks)))
@@ -738,12 +794,12 @@ def build_router(app: App) -> Router:
             text = f"{kind_icon(chat)} <b>{chat_title(chat)}</b>\n\n" + settings_text(app, cid, lang)
             return "chats", text, kb(
                 [cb_btn(t(lang, "btn_test"), f"c:test:{cid}"), cb_btn(t(lang, "btn_stats"), f"c:stats:{cid}"),
-                 cb_btn(t(lang, "btn_top"), f"c:top:{cid}")],
+                 cb_btn(t(lang, "btn_top"), f"c:top:{cid}"), cb_btn(t(lang, "btn_scan"), f"c:scan:{cid}")],
                 [cb_btn(t(lang, "btn_sells", state=t(lang, "off" if chat.sells else "on")), f"c:sells:{cid}"),
                  cb_btn(t(lang, "btn_chart", state=t(lang, "off" if chat.chart else "on")), f"c:chart:{cid}")],
                 [cb_btn(t(lang, "btn_chat_lang", lang=i18n.LANG_NAMES[other]), f"c:lang:{cid}"),
-                 cb_btn(t(lang, "btn_get_pro"), f"c:pro:{cid}")],
-                [cb_btn(t(lang, "btn_refresh"), f"m:chat:{cid}"), cb_btn(t(lang, "back_chats"), "m:chats")])
+                 cb_btn(t(lang, "btn_refresh"), f"m:chat:{cid}")],
+                [cb_btn(t(lang, "back_chats"), "m:chats")])
         if name == "stats":
             cid = int(arg) if arg else app.db.dm_chat(user.id)
             chat = app.db.get_chat(cid) if cid else None
@@ -752,14 +808,6 @@ def build_router(app: App) -> Router:
             return "stats", await stats_text(app, chat, lang), kb(
                 [cb_btn(t(lang, "btn_refresh"), f"m:stats:{cid}"), cb_btn(t(lang, "back_chats"), f"m:chat:{cid}")],
                 back(lang))
-        if name == "pro":
-            cid = app.db.dm_chat(user.id)
-            chat = app.db.get_chat(cid) if cid else None
-            rows = [[cb_btn(f"{t(lang, 'btn_get_pro')}: {chat.title or cid}"[:60], f"c:pro:{cid}")]] \
-                if chat and chat.active else []
-            return "pro", t(lang, "pro_menu", plans=plans_text(app.cfg, lang)), kb(*rows, back(lang))
-        if name == "ads":
-            return "ads", ads_text(app, lang), kb(back(lang))
         if name == "help":
             return "help", help_text(lang, private=True), kb(back(lang))
         if name == "terms":
@@ -789,6 +837,29 @@ def build_router(app: App) -> Router:
             return
         await cb.answer(await popup_text(app, token, lang), show_alert=True)
 
+    @router.callback_query(F.data.startswith("x:"))
+    async def scan_popup(cb: CallbackQuery):
+        """🛡 Scan under a post: the token's scan for whoever tapped it. Only tokens the bot
+        knows; a scan not made yet starts now, and the next tap shows it."""
+        lang = user_lang(app, cb.from_user)
+        token = app.db.get_token(cb.data[2:])
+        if token is None:
+            await cb.answer()
+            return
+        s = cached_scan(app, token.address)
+        if s is not None:
+            await cb.answer(render.scan_popup(s, lang), show_alert=True)
+            return
+        if token.address not in app.scanning:
+            spawn(quiet_scan(token.address))
+        await cb.answer(t(lang, "pop_scan_running", symbol=token.symbol)[:200], show_alert=True)
+
+    async def quiet_scan(address: str):
+        try:
+            await get_scan(app, address)
+        except Exception as e:
+            log.info("scan of %s for a pop-up failed: %s", address, e)
+
     @router.callback_query(F.data.startswith("lang:"))
     async def pick_lang(cb: CallbackQuery, bot: Bot):
         code = cb.data.split(":", 1)[1]
@@ -802,7 +873,7 @@ def build_router(app: App) -> Router:
 
     @router.callback_query(F.data.startswith("c:"))
     async def chat_button(cb: CallbackQuery, bot: Bot):
-        """Buttons of a chat's screen: test post, stats, sells, chart, language, Pro."""
+        """Buttons of a chat's screen: test post, stats, top buyers, sells, chart, language."""
         lang = user_lang(app, cb.from_user)
         try:
             _, act, cid = cb.data.split(":")
@@ -825,9 +896,13 @@ def build_router(app: App) -> Router:
                               kb([cb_btn(t(lang, "btn_refresh"), f"c:top:{cid}"),
                                   cb_btn(t(lang, "back_chats"), f"m:chat:{cid}")]))
             return
-        if act == "pro":
+        if act == "scan":
+            if not chat.token:
+                await cb.answer(re.sub(r"<[^>]+>", "", t(lang, "stats_no_token"))[:190], show_alert=True)
+                return
             await cb.answer()
-            await show_pro_offer(cb.message, cid, lang)
+            await edit_screen(cb, lang, "stats", await scan_answer(app, chat.token, lang),
+                              kb([cb_btn(t(lang, "back_chats"), f"m:chat:{cid}")]))
             return
         if act == "test":
             text, _ = await act_test(bot, cid, [], None, lang)
@@ -844,20 +919,6 @@ def build_router(app: App) -> Router:
         await cb.answer(re.sub(r"<[^>]+>", "", note)[:190])
         key, text, markup = await screen(bot, cb.from_user, "chat", str(cid))
         await edit_screen(cb, lang, key, text, markup)
-
-    @router.message(CommandStart(deep_link=True), private)
-    async def start_deep(message: Message, bot: Bot, command: CommandObject):
-        arg = command.args or ""
-        if arg.startswith("pro_"):
-            try:
-                chat_id = int(arg[4:])
-            except ValueError:
-                chat_id = 0
-            await show_pro_offer(message, chat_id, user_lang(app, message.from_user))
-        elif arg == "ads":
-            await show(message, bot, "ads")
-        else:
-            await start(message, bot)
 
     @router.message(CommandStart(), private)
     async def start(message: Message, bot: Bot):
@@ -890,19 +951,57 @@ def build_router(app: App) -> Router:
     async def terms(message: Message, bot: Bot):
         await show(message, bot, "terms")
 
-    @router.message(Command("paysupport"), private)
-    async def paysupport(message: Message, bot: Bot, command: CommandObject):
+    @router.message(Command("support", "paysupport"), private)
+    async def support(message: Message, bot: Bot, command: CommandObject):
+        """/support <text> goes to the owners, who answer by replying to it; at most one
+        message per person every SUPPORT_COOLDOWN seconds, so nobody can flood the
+        owners' chats. A message no owner got does not count against the person."""
         user = message.from_user
-        if command.args and user:
-            await notify_owners(bot, app, f"🆘 /paysupport from {user.id} "
-                                          f"(@{escape(user.username or '-')}):\n{escape(command.args)}")
-            await message.answer(t(user_lang(app, user), "support_sent"))
+        if command.args and user and app.cfg.owner_ids:
+            lang = user_lang(app, user)
+            wait = app.support_at.get(user.id, 0) + SUPPORT_COOLDOWN - time.time()
+            if wait > 0:
+                await message.answer(t(lang, "support_wait", m=max(1, round(wait / 60))))
+                return
+            app.support_at[user.id] = time.time()  # before the await: two at once cannot both pass
+            delivered = await notify_owners(
+                bot, app, f'{SUPPORT_HEAD}<a href="tg://user?id={user.id}">{user.id}</a> '
+                          f"(@{escape(user.username or '-')}):\n{escape(command.args[:1500])}\n\n"
+                          f"<i>Reply to this message to answer.</i>")
+            if not delivered:
+                app.support_at.pop(user.id, None)
+                await message.answer(t(lang, "support_failed"))
+                return
+            await message.answer(t(lang, "support_sent"))
             return
         await show(message, bot, "support")
 
+    @router.message(Command("scan"), private)
+    async def scan_private(message: Message, bot: Bot, command: CommandObject):
+        """/scan 0x… for anyone, or /scan alone for the current chat's token. A token not
+        scanned in the last minutes costs requests: one such scan a minute per person."""
+        lang = user_lang(app, message.from_user)
+        args = (command.args or "").split()
+        if args and abi.is_address(args[0]):
+            address = args[0].lower()
+        else:
+            cid = app.db.dm_chat(message.from_user.id) if not args else None
+            current = app.db.get_chat(cid) if cid else None
+            address = current.token if current and current.active else None
+        if not address:
+            await message.answer(t(lang, "scan_usage"))
+            return
+        if cached_scan(app, address) is None:
+            wait = app.scan_at.get(message.from_user.id, 0) + SCAN_COOLDOWN - time.time()
+            if wait > 0 and not is_owner(app, message.from_user.id):
+                await message.answer(t(lang, "scan_wait", s=max(1, round(wait))))
+                return
+            app.scan_at[message.from_user.id] = time.time()
+        await message.answer(await scan_answer(app, address, lang))
+
     # Group commands sent here apply to this person's current chat
-    # (/help and /lang have their own answers above).
-    @router.message(Command(*(a for a in actions if a not in ("help", "lang"))), private)
+    # (/help, /lang and /scan have their own answers above).
+    @router.message(Command(*(a for a in actions if a not in ("help", "lang", "scan"))), private)
     async def private_action(message: Message, bot: Bot, command: CommandObject):
         name = command.command.lower()
         chat_id = app.db.dm_chat(message.from_user.id)
@@ -916,163 +1015,20 @@ def build_router(app: App) -> Router:
     async def forwarded_from_channel(message: Message, bot: Bot, origin_id: int):
         await run_in_chat(message, bot, origin_id, "settings", [])
 
-    async def show_pro_offer(message: Message, chat_id: int, lang: str):
-        chat = app.db.get_chat(chat_id)
-        if not chat or not chat.active:
-            await message.answer(t(lang, "pro_not_in_chat"))
-            return
-        rows = [[(f"{i18n.weeks(w, lang)} — {s} ⭐", f"pro:{chat_id}:{w}")]
-                for w, s in sorted(app.cfg.pro_plans.items())]
-        status = t(lang, "pro_until", date=until(chat.pro_until, lang)) if chat.is_pro() else t(lang, "pro_status_free")
-        await message.answer(t(lang, "pro_offer", title=chat_title(chat), status=status),
-                             reply_markup=_kb(rows, callback=True))
-
-    @router.callback_query(F.data.startswith("pro:"))
-    async def buy_pro(cb: CallbackQuery, bot: Bot):
-        lang = user_lang(app, cb.from_user)
-        try:
-            _, chat_id, weeks = cb.data.split(":")
-            chat_id, weeks = int(chat_id), int(weeks)
-        except ValueError:
-            await cb.answer(t(lang, "try_again"), show_alert=True)
-            return
-        stars = app.cfg.pro_plans.get(weeks)
-        chat = app.db.get_chat(chat_id)
-        if not stars or not chat:
-            await cb.answer(t(lang, "offer_invalid"), show_alert=True)
-            return
-        label = f"Pro · {i18n.weeks(weeks, lang)}"
-        await bot.send_invoice(cb.from_user.id, title=label,
-                               description=t(lang, "invoice_pro_desc", title=chat.title or chat_id)[:255],
-                               payload=f"pro:{chat_id}:{weeks}", currency="XTR",
-                               prices=[LabeledPrice(label=label, amount=stars)])
-        await cb.answer()
-
-    @router.message(Command("advertise"), private)
-    async def advertise(message: Message, bot: Bot, command: CommandObject):
-        lang = user_lang(app, message.from_user)
-        parts = (command.args or "").split(maxsplit=2)
-        if len(parts) < 3:
-            await show(message, bot, "ads")
-            return
-        days_s, url, text = parts
-        text = " ".join(text.split())
-        try:
-            days = int(days_s)
-        except ValueError:
-            days = 0
-        if not 1 <= days <= app.cfg.ad_max_days:
-            await message.answer(t(lang, "ads_days", n=app.cfg.ad_max_days))
-            return
-        if not url.startswith("https://") or len(url) > 200 or any(c in url for c in "<>\"' "):
-            await message.answer(t(lang, "ads_link"))
-            return
-        if not 3 <= len(text) <= 60:
-            await message.answer(t(lang, "ads_text"))
-            return
-        if not app.cfg.owner_ids:
-            await message.answer(t(lang, "ads_closed"))
-            return
-        price = days * app.cfg.ad_day_stars
-        ad_id = app.db.create_ad(message.from_user.id, text, url, days, price)
-        await message.answer(t(lang, "ads_thanks", id=ad_id, days=i18n.days(days, lang), price=price))
-        user = message.from_user
-        await notify_owners(
-            bot, app,
-            f"📣 Ad #{ad_id} from {user.id} (@{escape(user.username or '-')}), {days} d, {price} ⭐\n"
-            f"Text: {escape(text)}\nLink: {escape(url)}",
-            _kb([[("✅ Approve", f"ad:ok:{ad_id}"), ("❌ Reject", f"ad:no:{ad_id}")]], callback=True))
-
-    @router.callback_query(F.data.startswith("ad:"))
-    async def review_ad(cb: CallbackQuery, bot: Bot):
-        if not is_owner(app, cb.from_user.id):
-            await cb.answer()
-            return
-        try:
-            _, verdict, ad_id = cb.data.split(":")
-            ad = app.db.get_ad(int(ad_id))
-        except ValueError:
-            ad = None
-        if not ad or ad.status != "pending":
-            await cb.answer("Already handled.", show_alert=True)
-            return
-        if verdict == "ok":
-            app.db.set_ad_status(ad.id, "approved")
-            note = "✅ approved, invoice sent"
-            try:
-                await bot.send_invoice(ad.user_id, title=f"Ad slot · {ad.days} day{'s' if ad.days > 1 else ''}",
-                                       description=ad.text, payload=f"ad:{ad.id}", currency="XTR",
-                                       prices=[LabeledPrice(label="Ad slot", amount=ad.price)])
-            except TelegramAPIError as e:
-                note = f"✅ approved, but the invoice failed: {escape(str(e))}"
-        else:
-            app.db.set_ad_status(ad.id, "rejected")
-            note = "❌ rejected"
-            try:
-                await bot.send_message(ad.user_id, t(app.db.user_lang(ad.user_id), "ads_rejected", id=ad.id))
-            except TelegramAPIError:
-                pass
-        await cb.answer()
-        if cb.message:
-            await cb.message.edit_text(f"{cb.message.html_text}\n\n{note}")
-
-    # ---- payments
-    def check_payload(payload: str, amount: int, currency: str, lang: str) -> str | None:
-        """None if the invoice can still be honoured, else the reason shown to the payer."""
-        if currency != "XTR":
-            return t(lang, "pay_currency")
-        kind, _, rest = payload.partition(":")
-        if kind == "pro":
-            try:
-                chat_id, weeks = (int(x) for x in rest.split(":"))
-            except ValueError:
-                return t(lang, "pay_invalid")
-            chat = app.db.get_chat(chat_id)
-            if not chat or not chat.active:
-                return t(lang, "pay_left")
-            if app.cfg.pro_plans.get(weeks) != amount:
-                return t(lang, "pay_prices")
-            return None
-        if kind == "ad":
-            ad = app.db.get_ad(int(rest)) if rest.isdigit() else None
-            if not ad or ad.status != "approved" or ad.price != amount:
-                return t(lang, "pay_ad_invalid")
-            return None
-        return t(lang, "pay_invalid")
-
-    @router.pre_checkout_query()
-    async def pre_checkout(query: PreCheckoutQuery):
-        reason = check_payload(query.invoice_payload, query.total_amount, query.currency,
-                               user_lang(app, query.from_user))
-        await query.answer(ok=reason is None, error_message=reason)
-
-    @router.message(F.successful_payment)
-    async def paid(message: Message, bot: Bot):
-        sp = message.successful_payment
-        user_id = message.from_user.id if message.from_user else 0
-        lang = user_lang(app, message.from_user)
-        if not app.db.record_payment(sp.telegram_payment_charge_id, user_id, sp.total_amount,
-                                     sp.invoice_payload):
-            return  # Telegram repeated the update
-        kind, _, rest = sp.invoice_payload.partition(":")
-        if kind == "pro":
-            chat_id, weeks = (int(x) for x in rest.split(":"))
-            ends = app.db.extend_pro(chat_id, weeks * 7 * 86400)
-            chat = app.db.get_chat(chat_id)
-            await message.answer(t(lang, "pro_paid", title=chat_title(chat), date=_date(ends)))
-            try:
-                await bot.send_message(chat_id, t(chat.lang, "pro_paid_chat"))
-            except TelegramAPIError:
-                pass
-        elif kind == "ad":
-            starts, ends = app.db.schedule_paid_ad(int(rest), sp.telegram_payment_charge_id)
-            await message.answer(t(lang, "ad_paid", starts=_date(starts), ends=_date(ends)))
-        await notify_owners(bot, app, f"💰 {sp.total_amount} ⭐ from {user_id}: "
-                                      f"{escape(sp.invoice_payload)}\n"
-                                      f"charge <code>{sp.telegram_payment_charge_id}</code>")
-
     # ---- owner tools
     owner_only = F.from_user.id.in_(app.cfg.owner_ids)
+
+    @router.message(private, owner_only, F.reply_to_message.text.startswith(SUPPORT_HEAD))
+    async def support_reply(message: Message, bot: Bot):
+        """An owner's reply to a /support message goes back to the person who sent it."""
+        head = message.reply_to_message.text[len(SUPPORT_HEAD):].split(" ", 1)[0]
+        if not head.isdigit():
+            return
+        try:
+            await bot.copy_message(int(head), message.chat.id, message.message_id)
+            await message.reply("✅ Delivered.")
+        except TelegramAPIError as e:
+            await message.reply(f"Not delivered: {escape(str(e))}")
 
     def panel_back(lang: str) -> list[InlineKeyboardButton]:
         return [cb_btn(t(lang, "adm_btn_back"), "a:home")]
@@ -1081,20 +1037,13 @@ def build_router(app: App) -> Router:
         lines, rows = [], []
         for c in chats:
             token = app.db.get_token(c.token) if c.token else None
-            pro = f" · ⭐ {until(c.pro_until, lang)}" if c.is_pro() else ""
             lines.append(f"{kind_icon(c)} <b>{chat_title(c)}</b> — "
-                         f"{escape(token.symbol) if token else t(lang, 'no_token')}{pro}")
-            rows.append([cb_btn(f"{'⭐ ' if c.is_pro() else ''}{kind_icon(c)} {c.title or c.chat_id}"[:60],
-                                f"a:chat:{c.chat_id}")])
+                         f"{escape(token.symbol) if token else t(lang, 'no_token')}")
+            rows.append([cb_btn(f"{kind_icon(c)} {c.title or c.chat_id}"[:60], f"a:chat:{c.chat_id}")])
         return lines, rows
 
     async def panel(user: User, name: str, arg: str = "") -> tuple[str, InlineKeyboardMarkup]:
         lang = user_lang(app, user)
-        if name == "pro":
-            chats = app.db.pro_chats()
-            lines, rows = chat_rows(chats, lang)
-            text = "\n".join([t(lang, "adm_pro_title", n=len(chats)), ""] + (lines or [t(lang, "adm_none")]))
-            return text, kb(*rows, panel_back(lang))
         if name == "chats":
             page = int(arg or 0)
             chats, total = app.db.active_chats(page * 20, 20)
@@ -1116,37 +1065,8 @@ def build_router(app: App) -> Router:
                      added_by=added, token=escape(token.symbol) if token else t(lang, "no_token"),
                      lang=i18n.LANG_NAMES[i18n.norm(c.lang)], sells=t(lang, "on" if c.sells else "off"),
                      chart=t(lang, "on" if c.chart else "off"), d=posted["today"], w=posted["week"],
-                     a=posted["all"],
-                     pro=t(lang, "adm_pro_on", date=until(c.pro_until, lang)) if c.is_pro()
-                     else t(lang, "adm_pro_off"))
-            cid = c.chat_id
-            return text, kb([cb_btn(t(lang, "adm_btn_days", n=n), f"a:grant:{cid}:{n}") for n in (7, 30, 365)],
-                            [cb_btn(t(lang, "adm_btn_forever"), f"a:grant:{cid}:0"),
-                             cb_btn(t(lang, "adm_btn_revoke"), f"a:revoke:{cid}")],
-                            [cb_btn(t(lang, "adm_btn_pro"), "a:pro"), cb_btn(t(lang, "adm_btn_chats"), "a:chats:0")],
-                            panel_back(lang))
-        if name == "ads":
-            lines = [t(lang, "adm_ads_title"), ""]
-            rows = []
-            for status in ("pending", "approved", "paid"):
-                for ad in app.db.ads_by_status(status):
-                    when = f" {_date(ad.starts_at)} → {_date(ad.ends_at)}" if ad.starts_at else ""
-                    lines.append(f"#{ad.id} {status} · {ad.days} d · {ad.price} ⭐{when}\n{escape(ad.text)}")
-                    if status == "pending":
-                        rows.append([cb_btn(f"✅ #{ad.id}", f"ad:ok:{ad.id}"), cb_btn(f"❌ #{ad.id}", f"ad:no:{ad.id}")])
-            if len(lines) == 2:
-                lines.append(t(lang, "adm_none"))
-            return "\n".join(lines), kb(*rows, panel_back(lang))
-        if name == "pay":
-            rows = app.db.recent_payments()
-            lines = [t(lang, "adm_pay_title", total=app.db.stats()["stars_total"]), ""]
-            for r in rows:
-                note = f" · {t(lang, 'adm_refunded')}" if r["refunded"] else ""
-                lines.append(f"{_date(r['created_at'])} · <b>{r['amount']} ⭐</b> · {r['user_id']} · "
-                             f"<code>{escape(r['payload'])}</code>{note}")
-            if not rows:
-                lines.append(t(lang, "adm_none"))
-            return "\n".join(lines), kb(panel_back(lang))
+                     a=posted["all"])
+            return text, kb([cb_btn(t(lang, "adm_btn_chats"), "a:chats:0")], panel_back(lang))
         # the panel's home: a summary of the bot
         s = app.db.stats()
         w = app.watcher
@@ -1159,13 +1079,12 @@ def build_router(app: App) -> Router:
             watcher = (t(lang, "adm_watch_ok", s=int(age), lag=lag) if age < 120 else
                        t(lang, "adm_watch_bad", m=int(age // 60), err=escape(w.last_error or "-")))
         text = t(lang, "adm_title") + "\n\n" + t(
-            lang, "adm_summary", active=s["chats_active"], tracking=s["chats_tracking"], pro=s["chats_pro"],
-            tokens=s["tokens_tracked"], outbox=s["outbox"], stars=s["stars_total"], ads=s["ads_pending"],
-            users=sum(app.db.users_by_lang().values()), watcher=watcher)
+            lang, "adm_summary", active=s["chats_active"], tracking=s["chats_tracking"],
+            tokens=s["tokens_tracked"], outbox=s["outbox"], users=sum(app.db.users_by_lang().values()),
+            watcher=watcher)
         text += "\n" + t(lang, "adm_health", mb=process_mb(), up=round((time.time() - app.started) / 3600, 1),
                           backup=last_backup(app) or "—")
-        return text, kb([cb_btn(t(lang, "adm_btn_pro"), "a:pro"), cb_btn(t(lang, "adm_btn_chats"), "a:chats:0")],
-                        [cb_btn(t(lang, "adm_btn_ads"), "a:ads"), cb_btn(t(lang, "adm_btn_pay"), "a:pay")],
+        return text, kb([cb_btn(t(lang, "adm_btn_chats"), "a:chats:0")],
                         [cb_btn(t(lang, "btn_refresh"), "a:home"), cb_btn(t(lang, "back"), "m:home")])
 
     @router.message(Command("admin", "panel"), private, owner_only)
@@ -1181,22 +1100,26 @@ def build_router(app: App) -> Router:
             return
         parts = cb.data.split(":")
         name, arg = parts[1], parts[2] if len(parts) > 2 else ""
-        note = None
-        if name == "grant":
-            cid, days = int(parts[2]), int(parts[3])
-            chat = app.db.get_chat(cid)
-            if chat is not None:
-                ends = FOREVER if days == 0 else max(chat.pro_until, int(time.time())) + days * 86400
-                app.db.set_pro_until(cid, ends)
-                note = t(lang, "adm_granted", date=until(ends, lang))
-            name, arg = "chat", str(cid)
-        elif name == "revoke":
-            app.db.set_pro_until(int(arg), int(time.time()))
-            note = t(lang, "adm_revoked")
-            name = "chat"
-        await cb.answer(note or None)
+        await cb.answer()
         text, markup = await panel(cb.from_user, name, arg)
         await edit_screen(cb, lang, "stats", text, markup)
+
+    @router.message(Command("emojipack"), private, owner_only)
+    async def emoji_pack(message: Message, bot: Bot):
+        """Upload the Silverhand custom emoji (assets/emoji) as the bot's emoji set, owned by
+        the owner who asks, and start using them in posts. Again: the drawings are replaced."""
+        try:
+            total, sent = await emoji.upload(bot, message.from_user.id, app.username, app.db)
+        except Exception as e:
+            log.warning("emoji upload failed: %s", e)
+            await message.answer(f"Emoji upload failed: {escape(str(e))}")
+            return
+        ids = emoji.load(app.db)
+        row = emoji.brand(" ".join(emoji.PACK.values()), ids)
+        await message.answer(f"✅ {total} custom emoji in "
+                             f'<a href="https://t.me/addemoji/{emoji.set_name(app.username)}">the set</a> '
+                             f"({sent} uploaded now). Posts in groups use them from now on; "
+                             f"channels keep the plain ones.\n\n{row}")
 
     @router.message(Command("botstats"), private, owner_only)
     async def botstats(message: Message):
@@ -1219,47 +1142,10 @@ def build_router(app: App) -> Router:
         lines.append(f"ETH: {render.fmt_usd(eth) if eth else 'unknown'}")
         await message.answer("\n".join(lines))
 
-    @router.message(Command("grantpro"), private, owner_only)
-    async def grantpro(message: Message, command: CommandObject):
-        try:
-            chat_id, days = (int(x) for x in (command.args or "").split())
-        except ValueError:
-            await message.answer("Usage: /grantpro <code>chat_id</code> <code>days</code>")
-            return
-        if not app.db.get_chat(chat_id):
-            await message.answer("Unknown chat.")
-            return
-        ends = app.db.extend_pro(chat_id, days * 86400)
-        await message.answer(f"Pro for {chat_id} until {_date(ends)}.")
-
-    @router.message(Command("refund"), private, owner_only)
-    async def refund(message: Message, bot: Bot, command: CommandObject):
-        charge = (command.args or "").strip()
-        row = app.db.get_payment(charge) if charge else None
-        if not row or row["refunded"]:
-            await message.answer("Usage: /refund <code>charge_id</code> (unknown or already refunded)")
-            return
-        try:
-            await bot.refund_star_payment(row["user_id"], charge)
-        except TelegramAPIError as e:
-            await message.answer(f"Refund failed: {escape(str(e))}")
-            return
-        app.db.mark_refunded(charge)
-        kind, _, rest = row["payload"].partition(":")
-        if kind == "pro":
-            chat_id, weeks = (int(x) for x in rest.split(":"))
-            app.db.extend_pro(chat_id, -weeks * 7 * 86400)
-        elif kind == "ad":
-            app.db.set_ad_status(int(rest), "rejected")
-        await message.answer(f"Refunded {row['amount']} ⭐ to {row['user_id']}.")
-
-    @router.message(Command("ads"), private, owner_only)
-    async def ads(message: Message):
-        lines = ["<b>Ads</b>"]
-        for status in ("pending", "approved", "paid"):
-            for ad in app.db.ads_by_status(status):
-                when = f" {_date(ad.starts_at)} → {_date(ad.ends_at)}" if ad.starts_at else ""
-                lines.append(f"#{ad.id} {status} {ad.days} d {ad.price} ⭐{when}: {escape(ad.text)}")
-        await message.answer("\n".join(lines) if len(lines) > 1 else "No ads.")
+    # Buttons of removed features (Pro, ads) may still sit in old messages: answer them
+    # quietly so they do not spin. Registered last, after every real handler.
+    @router.callback_query()
+    async def stale_button(cb: CallbackQuery):
+        await cb.answer()
 
     return router
