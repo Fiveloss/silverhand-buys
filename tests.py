@@ -2021,6 +2021,7 @@ class EthPoolQuotes(unittest.TestCase):
         self.assertEqual(pools.eth_pool_id(TEST_AAPL),
                          "0x60e44167df8938068cdb05cbeb03b66223261778112681a0484bcf337aea870a")
 
+    @needs("aiogram")
     def test_share_on_x(self):
         """Buys, levels and graduations get an X Share button in a row of its own, with
         the post's line and the token's page; sells get none."""
