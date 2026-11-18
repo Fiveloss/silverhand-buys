@@ -1,7 +1,7 @@
 """SQLite storage. One file, WAL mode, used from the event loop's thread only.
 
 The watcher writes a tick's outbox rows and its new last block in one
-transaction, so a restart neither loses nor repeats a buy. Big integers
+transaction. External delivery can repeat after an ambiguous Telegram result. Big integers
 (supplies, thresholds in wei) are stored as TEXT: they overflow SQLite's int64.
 """
 
@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS tokens (
     phantom TEXT,
     graduated INTEGER NOT NULL DEFAULT 0,
     added_at INTEGER NOT NULL,
-    kind TEXT NOT NULL DEFAULT 'pons'   -- 'pons' (curve, then its v4 pool) | 'flap' (curve) | 'dex' (pools)
+    kind TEXT NOT NULL DEFAULT 'pons'   -- 'pons' | 'vibe' (curve, then its v4 pool) | 'flap' (curve) | 'dex' (pools)
 );
 CREATE TABLE IF NOT EXISTS pools (
     token TEXT NOT NULL,
@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS outbox (
     payload TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
+    not_before REAL NOT NULL DEFAULT 0,
     UNIQUE (chat_id, dedupe)
 );
 CREATE TABLE IF NOT EXISTS trades (
@@ -92,6 +93,12 @@ CREATE TABLE IF NOT EXISTS trades (
     PRIMARY KEY (token, uid)
 );
 CREATE INDEX IF NOT EXISTS trades_token_ts ON trades(token, ts);
+CREATE TABLE IF NOT EXISTS buyers (  -- every wallet seen buying a token; kept when trades are pruned
+    token TEXT NOT NULL,
+    wallet TEXT NOT NULL,
+    uid TEXT NOT NULL,       -- its first buy the bot saw (a trades uid)
+    PRIMARY KEY (token, wallet)
+);
 CREATE TABLE IF NOT EXISTS chat_stats (
     chat_id INTEGER NOT NULL,
     day TEXT NOT NULL,       -- UTC date, YYYY-MM-DD
@@ -102,8 +109,10 @@ CREATE TABLE IF NOT EXISTS chat_stats (
 );
 """
 
+# A new chat skips buys under this many dollars (dust); its admins change it with /minbuy.
+DEFAULT_MIN_USD = 1.0
 CHAT_SETTINGS = {"title", "token", "min_usd", "emoji", "step_usd", "media_kind", "media_file_id",
-                 "active", "sells", "chart", "lang", "added_by", "kind", "thread_id", "whale_usd"}
+                 "active", "sells", "chart", "lang", "added_by", "kind", "thread_id", "whale_usd", "digest", "alerts"}
 # Columns added after the first release: (table, column, definition). A database
 # made before them gets them on start.
 MIGRATIONS = [("chats", "sells", "INTEGER NOT NULL DEFAULT 0"),
@@ -113,8 +122,11 @@ MIGRATIONS = [("chats", "sells", "INTEGER NOT NULL DEFAULT 0"),
               ("chats", "kind", "TEXT"),
               ("chats", "thread_id", "INTEGER"),
               ("chats", "whale_usd", "REAL NOT NULL DEFAULT 1000"),
+              ("chats", "digest", "INTEGER NOT NULL DEFAULT 1"),
+              ("chats", "alerts", "INTEGER NOT NULL DEFAULT 1"),
               ("trades", "wallet", "TEXT"),
-              ("tokens", "kind", "TEXT NOT NULL DEFAULT 'pons'")]
+              ("tokens", "kind", "TEXT NOT NULL DEFAULT 'pons'"),
+              ("outbox", "not_before", "REAL NOT NULL DEFAULT 0")]
 
 
 @dataclass
@@ -125,7 +137,7 @@ class Token:
     pair: str
     quote_symbol: str
     quote_decimals: int
-    quote_kind: str  # "eth" | "usd" | "other"
+    quote_kind: str  # "eth" | "usd" | "feed:<address>" | "vibe:<curve>:<pool>" | "other" (quotes.Rates)
     name: str
     symbol: str
     decimals: int
@@ -136,7 +148,7 @@ class Token:
     phantom: int | None   # the curve's virtual quote reserve, not counted toward graduation
     graduated: bool
     added_at: int
-    kind: str = "pons"    # "pons": its curve, then its v4 pool; "flap": its Flap curve;
+    kind: str = "pons"    # "pons"/"vibe": its curve, then its v4 pool; "flap": its Flap curve;
                           # "dex": the pools in `pools`
 
 
@@ -159,6 +171,8 @@ class Chat:
     kind: str | None = None      # "channel", "supergroup", "group"
     thread_id: int | None = None # the forum topic posts go to (set by /track sent in it)
     whale_usd: float = 1000.0    # buys from this many dollars get the 🐋 mark; 0 turns it off
+    digest: bool = True          # the daily digest (digest.py)
+    alerts: bool = True          # a sharp drop is told to the admin who added the bot (watcher.dump_alerts)
 
 
 @dataclass
@@ -184,7 +198,7 @@ def _chat(r: sqlite3.Row) -> Chat:
     return Chat(r["chat_id"], r["title"], r["token"], r["min_usd"], r["emoji"], r["step_usd"],
                 r["media_kind"], r["media_file_id"], bool(r["active"]),
                 r["created_at"], bool(r["sells"]), int(r["chart"]), r["lang"], r["added_by"], r["kind"],
-                r["thread_id"], r["whale_usd"])
+                r["thread_id"], r["whale_usd"], bool(r["digest"]), bool(r["alerts"]))
 
 
 class Db:
@@ -199,6 +213,10 @@ class Db:
             if column not in have:
                 self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
         self._drop_paid_plan()
+        # buyers came after trades: learn the ones the kept trades already name
+        self.conn.execute("INSERT OR IGNORE INTO buyers(token, wallet, uid) SELECT token, wallet, uid FROM "
+                          "(SELECT token, LOWER(wallet) AS wallet, uid, MIN(ts) FROM trades "
+                          "WHERE side=1 AND wallet IS NOT NULL GROUP BY token, LOWER(wallet))")
         self.conn.commit()
 
     def _drop_paid_plan(self) -> None:
@@ -218,6 +236,20 @@ class Db:
 
     def close(self) -> None:
         self.conn.close()
+
+    def bind_chain(self, chain_id: int, legacy_chain_id: int | None = None) -> None:
+        """Refuse to reuse state across networks; legacy data needs an explicit label."""
+        saved = self.get_meta("chain_id")
+        if saved is not None and int(saved) != chain_id:
+            raise ValueError(f"Database belongs to chain {saved}, RPC is chain {chain_id}. "
+                             "Use a separate DB_PATH for each network.")
+        if saved is None:
+            populated = self.conn.execute("SELECT EXISTS(SELECT 1 FROM tokens) OR "
+                                          "EXISTS(SELECT 1 FROM chats)").fetchone()[0]
+            if populated and legacy_chain_id != chain_id:
+                raise ValueError("Legacy database has no network label. Confirm its original network "
+                                 "with DB_CHAIN_ID before upgrading, or choose a new DB_PATH.")
+            self.set_meta("chain_id", str(chain_id))
 
     def backup(self, folder: str, keep: int = 7, now: float | None = None) -> str | None:
         """A copy of the database for today (UTC) in `folder`, made with SQLite's own
@@ -249,6 +281,10 @@ class Db:
         with self.conn:
             self.conn.execute("INSERT INTO meta(key, value) VALUES(?, ?) "
                               "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+    def delete_meta(self, key: str) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM meta WHERE key=?", (key,))
 
     def last_block(self) -> int | None:
         v = self.get_meta("last_block")
@@ -353,6 +389,11 @@ class Db:
                     n += 1
         return n
 
+    def set_quote_kind(self, token: str, kind: str) -> None:
+        """A token's quote got a way to be valued (tokens.eth_pool_kind)."""
+        with self.conn:
+            self.conn.execute("UPDATE tokens SET quote_kind=? WHERE address=?", (kind, token.lower()))
+
     # --- pools of dex tokens ---
     def set_pools(self, token: str, pools: list) -> None:
         """Replace the pools watched for a token (pools.Pool items)."""
@@ -384,11 +425,11 @@ class Db:
     # --- chats ---
     def ensure_chat(self, chat_id: int, title: str = "") -> Chat:
         with self.conn:
-            self.conn.execute("INSERT INTO chats(chat_id, title, created_at) VALUES (?,?,?) "
+            self.conn.execute("INSERT INTO chats(chat_id, title, created_at, min_usd) VALUES (?,?,?,?) "
                               "ON CONFLICT(chat_id) DO UPDATE SET active=1, "
                               "title=CASE WHEN excluded.title='' THEN chats.title "
                               "ELSE excluded.title END",
-                              (chat_id, title, int(time.time())))
+                              (chat_id, title, int(time.time()), DEFAULT_MIN_USD))
         return self.get_chat(chat_id)
 
     def get_chat(self, chat_id: int) -> Chat | None:
@@ -466,8 +507,9 @@ class Db:
         return [_chat(r) for r in rows]
 
     # --- outbox ---
-    def commit_tick(self, rows: list[tuple[int, str, str, dict]], last_block: int,
-                    graduated: list[str] = (), trades: list[tuple] = ()) -> int:
+    def commit_tick(self, rows: list[tuple[int, str, str, dict]], last_block: int | None,
+                    graduated: list[str] = (), trades: list[tuple] = (),
+                    meta_updates: dict[str, str] | None = None) -> int:
         """Store a tick's messages, trades for charts, graduations and progress
         atomically. Returns outbox rows added."""
         now = int(time.time())
@@ -481,10 +523,18 @@ class Db:
             self._insert_trades(trades)
             for token in graduated:
                 self.conn.execute("UPDATE tokens SET graduated=1 WHERE address=?", (token,))
-            self.conn.execute("INSERT INTO meta(key, value) VALUES('last_block', ?) "
-                              "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                              (str(last_block),))
+            updates = dict(meta_updates or {})
+            if last_block is not None:
+                updates["last_block"] = str(last_block)
+            self.conn.executemany("INSERT INTO meta(key, value) VALUES(?, ?) "
+                                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                  updates.items())
         return added
+
+    def queue_events(self, rows: list[tuple[int, str, str, dict]],
+                     meta_updates: dict[str, str]) -> int:
+        """Queue scheduled events and their 'already queued' markers atomically."""
+        return self.commit_tick(rows, None, meta_updates=meta_updates)
 
     # --- trades, for charts ---
     def _insert_trades(self, trades) -> None:
@@ -493,11 +543,20 @@ class Db:
         self.conn.executemany("INSERT INTO trades(token, uid, ts, price, quote, side, wallet) "
                               "VALUES (?,?,?,?,?,?,?) ON CONFLICT(token, uid) DO UPDATE SET "
                               "wallet=COALESCE(trades.wallet, excluded.wallet)", rows)
+        # in the order given (oldest first), so the first buy a wallet is known by is its earliest
+        self.conn.executemany("INSERT OR IGNORE INTO buyers(token, wallet, uid) VALUES (?,?,?)",
+                              [(r[0], r[6].lower(), r[1]) for r in rows if r[5] == 1 and r[6]])
 
     def add_trades(self, trades: list[tuple]) -> None:
         """(token, uid, ts, price, quote, side) rows; repeats are ignored."""
         with self.conn:
             self._insert_trades(trades)
+
+    def recent_trades(self, token: str, limit: int = 12) -> list[tuple[int, float, int, str | None]]:
+        """The token's last trades, newest first: (time, size in quote, side, wallet)."""
+        rows = self.conn.execute("SELECT ts, quote, side, wallet FROM trades WHERE token=? "
+                                 "ORDER BY ts DESC, uid DESC LIMIT ?", (token.lower(), limit)).fetchall()
+        return [tuple(r) for r in rows]
 
     def trades_since(self, token: str, ts: int) -> list[tuple[int, float, float, int]]:
         rows = self.conn.execute("SELECT ts, price, quote, side FROM trades WHERE token=? AND ts>=? "
@@ -526,6 +585,17 @@ class Db:
                               "AND wallet IS NOT NULL", (token.lower(), since)).fetchone()[0]
         return [tuple(r) for r in rows], n
 
+    def earlier_buyers(self, token: str, buys: list[tuple[str, str]]) -> set[str]:
+        """Of (wallet, uid) buys, the wallets already known to have bought the token
+        before: by another buy than this one."""
+        out = set()
+        for wallet, uid in buys:
+            r = self.conn.execute("SELECT uid FROM buyers WHERE token=? AND wallet=?",
+                                  (token.lower(), wallet.lower())).fetchone()
+            if r and r[0] != uid:
+                out.add(wallet.lower())
+        return out
+
     def last_trade_ts(self, token: str) -> int | None:
         r = self.conn.execute("SELECT MAX(ts) FROM trades WHERE token=?", (token.lower(),)).fetchone()
         return r[0] if r else None
@@ -541,9 +611,16 @@ class Db:
                               (chat_id, kind, dedupe, json.dumps(payload), int(time.time())))
 
     def pending_outbox(self, limit: int = 1000) -> list[OutboxRow]:
-        rows = self.conn.execute("SELECT * FROM outbox ORDER BY id LIMIT ?", (limit,)).fetchall()
+        rows = self.conn.execute("SELECT * FROM outbox WHERE not_before<=? ORDER BY id LIMIT ?",
+                                 (time.time(), limit)).fetchall()
         return [OutboxRow(r["id"], r["chat_id"], r["kind"], json.loads(r["payload"]),
                           r["created_at"], r["attempts"]) for r in rows]
+
+    def defer_outbox(self, ids: list[int], until: float) -> None:
+        """Persist a retry deadline so a restart cannot bypass a Telegram flood wait."""
+        with self.conn:
+            self.conn.executemany("UPDATE outbox SET not_before=?, attempts=attempts+1 WHERE id=?",
+                                  [(until, row_id) for row_id in ids])
 
     def delete_outbox(self, ids: list[int]) -> None:
         if ids:
@@ -560,8 +637,16 @@ class Db:
         with self.conn:
             self.conn.execute("DELETE FROM outbox WHERE chat_id=?", (chat_id,))
 
-    def outbox_size(self) -> int:
-        return self.conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
+    def outbox_size(self, chat_id: int | None = None) -> int:
+        sql = "SELECT COUNT(*) FROM outbox"
+        return self.conn.execute(sql if chat_id is None else sql + " WHERE chat_id=?",
+                                  () if chat_id is None else (chat_id,)).fetchone()[0]
+
+    def oldest_outbox_age(self, now: float | None = None, chat_id: int | None = None) -> float:
+        sql = "SELECT MIN(created_at) FROM outbox"
+        row = self.conn.execute(sql if chat_id is None else sql + " WHERE chat_id=?",
+                                 () if chat_id is None else (chat_id,)).fetchone()
+        return max(0.0, (time.time() if now is None else now) - row[0]) if row[0] is not None else 0.0
 
     # --- stats ---
     def stats(self) -> dict:

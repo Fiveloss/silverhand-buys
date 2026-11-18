@@ -5,8 +5,8 @@ pydantic alone ~155 MB). An animated card costs ~25 MB in Python plus ~70 MB for
 ffmpeg, and two of them at once (a test post while the sender draws, two chats right
 after /track) went over the cap. So:
 
-- `async with heavy.slot():` one card being drawn (sender.make_chart). Another card
-  waits its turn, a second or so, instead of running alongside.
+- `async with heavy.slot():` one render at a time. Live posts use `wait=False`
+  and fall back to text if it is occupied; explicit previews and promos wait.
 - `async with heavy.backfill():` one history backfill at a time (Watcher.backfill):
   two /track right after each other, or the backfills after a restart, load in turn.
   It does not take the slot: a backfill window is only a megabyte or two.
@@ -53,9 +53,15 @@ def release() -> None:
 
 
 @asynccontextmanager
-async def slot():
-    async with _lock("slot", lambda: asyncio.Semaphore(1)):
-        yield
+async def slot(*, wait: bool = True):
+    lock = _lock("slot", lambda: asyncio.Semaphore(1))
+    # No suspension between checking and acquiring an available semaphore: another
+    # coroutine cannot take the slot in between. Live posts may fall back to text.
+    if not wait and lock.locked():
+        yield False
+        return
+    async with lock:
+        yield True
 
 
 @asynccontextmanager

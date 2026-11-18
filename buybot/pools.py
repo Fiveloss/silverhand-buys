@@ -23,7 +23,7 @@ import logging
 from dataclasses import dataclass
 
 from . import abi, quotes
-from .chain import POOL_MANAGER, TOPIC_TRANSFER, TOPIC_V4_SWAP, currencies, v4_token_price
+from .chain import POOL_MANAGER, TOPIC_TRANSFER, TOPIC_V4_SWAP, currencies, pool_id, v4_token_price
 from .keccak import keccak256
 
 log = logging.getLogger(__name__)
@@ -71,6 +71,7 @@ ROUTERS = {
     "0x204faca1764b154221e35c0d20abb3c525710498",  # Universal Router 2.1.2
     "0xcaf681a66d020601342297493863e78c959e5cb2",  # SwapRouter02
     "0x89e5db8b5aa49aa85ac63f691524311aeb649eba",  # Uniswap v2 router
+    "0x2784448c519d01d3ae257c0aac0b7cdad8acceb1",  # vibe/vibe router (testnet)
 }
 
 MIN_POOL_USD = 1_000     # pools besides the deepest need this much liquidity ...
@@ -234,7 +235,9 @@ def payouts(logs: list[dict], payers: set[str]) -> dict[tuple[str, str], str]:
     A pool (or the PoolManager) sends the token to someone; a trading bot's contract or
     a router then often passes the same amount on, hop by hop, in the same transaction
     (seen on mainnet: pool -> bot -> ... -> wallet). The wallet is where the tokens stop.
-    An end that is a known router is not a wallet, so nothing is named then."""
+    An end that is a known router is not a wallet, so nothing is named then. The token
+    contract itself is never the buyer: a taxed token (vibe/vibe's pool hook) gets its tax
+    from the pool in the same transaction, often before the buyer's share."""
     moves: dict[tuple[str, str], list[tuple[int, str, str, int]]] = {}
     for lg in logs:
         t = [x.lower() for x in lg.get("topics") or []]
@@ -249,7 +252,8 @@ def payouts(logs: list[dict], payers: set[str]) -> dict[tuple[str, str], str]:
     out = {}
     for key, mv in moves.items():
         mv.sort()
-        hop = next(((i, to, v) for i, frm, to, v in mv if frm in payers and to not in payers), None)
+        hop = next(((i, to, v) for i, frm, to, v in mv
+                    if frm in payers and to not in payers and to != key[0]), None)
         if hop is None:
             continue
         for _ in range(MAX_HOPS):
@@ -261,6 +265,21 @@ def payouts(logs: list[dict], payers: set[str]) -> dict[tuple[str, str], str]:
             hop = nxt
         if hop[1] not in ROUTERS:
             out[key] = hop[1]
+    return out
+
+
+def taxes(logs: list[dict], payers: set[str]) -> dict[tuple[str, str], int]:
+    """(token, tx) -> what a pool sent the token's own contract in that transaction: a
+    taxed token's cut of a pool trade (vibe/vibe's pool hook takes it in tokens)."""
+    out: dict[tuple[str, str], int] = {}
+    for lg in logs:
+        t = [x.lower() for x in lg.get("topics") or []]
+        if len(t) != 3 or t[0] != TOPIC_TRANSFER:
+            continue
+        token = lg.get("address", "").lower()
+        value, pos = abi.decode_uint(lg.get("data") or "0x"), _pos(lg)
+        if abi.topic_address(t[1]) in payers and abi.topic_address(t[2]) == token and value and pos:
+            out[(token, pos[1])] = out.get((token, pos[1]), 0) + value
     return out
 
 
@@ -280,6 +299,22 @@ async def v4_state(rpc, pool_id: str) -> tuple[int, int] | None:
     if s0 is None or liq is None:
         return None
     return s0 & ((1 << 160) - 1), liq & ((1 << 128) - 1)
+
+
+async def eth_pool_price(rpc, token: str, pool_id: str, decimals: int = 18) -> float | None:
+    """ETH per whole token from the token's v4 pool against ETH (quotes.ETH_POOL_FEE and
+    _SPACING, no hook); None when the pool is thinner than quotes.ETH_POOL_MIN_DEPTH."""
+    got = await v4_state(rpc, pool_id)
+    if not got or not got[0]:
+        return None
+    if v4_quote_depth(got[0], got[1], token, abi.ZERO_ADDRESS) < quotes.ETH_POOL_MIN_DEPTH:
+        return None
+    return v4_token_price(got[0], token, abi.ZERO_ADDRESS, decimals, 18)
+
+
+def eth_pool_id(token: str) -> str:
+    """The PoolId of a token's plain v4 pool against ETH, the one quotes.ETH_POOL_* describes."""
+    return pool_id(token, abi.ZERO_ADDRESS, quotes.ETH_POOL_FEE, quotes.ETH_POOL_SPACING, abi.ZERO_ADDRESS)
 
 
 def v4_quote_depth(sqrt_price_x96: int, liquidity: int, token: str, quote: str) -> int:

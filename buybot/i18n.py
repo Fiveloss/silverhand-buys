@@ -4,7 +4,9 @@ with /lang); a chat's language (/lang in the chat) is used for its posts and for
 the bot's answers there.
 """
 
-LANGS = ("en", "ru")
+import re
+
+LANGS = ("en", "ru")  # main.py narrows it to the config's LANGS (LANGS=en: English only)
 LANG_NAMES = {"en": "🇬🇧 English", "ru": "🇷🇺 Русский"}
 
 
@@ -31,15 +33,32 @@ def plural(n: int, lang: str, en: tuple[str, str], ru: tuple[str, str, str]) -> 
 
 def t(lang: str | None, key: str, /, **kw) -> str:
     en, ru = TEXTS[key]
-    s = ru if lang == "ru" else en
+    s = ru if lang == "ru" and "ru" in LANGS else en
+    if len(LANGS) == 1:  # one language: no hints about switching it
+        s = re.sub(r"^/lang\b[^\n]*\n?", "", s, flags=re.M)
+        s = re.sub(r"( · |\s*Usage: )/lang\b[^\n]*", "", s)
     return s.format(**kw) if kw else s
 
 
 TEXTS: dict[str, tuple[str, str]] = {
+    "health_chain": ("RPC {rpc_age}s ago · head advanced {head_age}s ago · block lag {lag}",
+                     "RPC {rpc_age} с назад · блоки продвигались {head_age} с назад · отставание {lag} бл."),
+    "health_sender": ("Delivery loop {sender_age}s ago · last sent {sent_age}s ago · oldest queued {queue_age}s",
+                      "Цикл доставки {sender_age} с назад · отправка {sent_age} с назад · старейший пост {queue_age} с"),
+    "health_issue_rpc": ("RPC has stopped responding", "RPC не отвечает"),
+    "health_issue_head": ("RPC block height has stopped advancing", "Высота блока RPC не растёт"),
+    "health_issue_watcher": ("Chain processing has stalled", "Обработка блоков остановилась"),
+    "health_issue_sender": ("Delivery processing has stalled", "Обработка доставки остановилась"),
+    "health_issue_queue": ("Posts have been queued for over 5 minutes", "Посты ждут в очереди больше 5 минут"),
+    "health_issue_task": ("A background task has stopped", "Фоновая задача остановилась"),
+    "health_warning": ("⚠️ Bot needs attention: {issues}", "⚠️ Боту нужно внимание: {issues}"),
+    "health_recovered": ("✅ Chain processing and delivery are working again.", "✅ Обработка блоков и доставка снова работают."),
+    "promo_testnet_only": ("Promo videos are currently available only for vibe/vibe on Robinhood Chain testnet.",
+                           "Промо-видео пока доступны только для vibe/vibe в тестовой сети Robinhood Chain."),
     # ---- shared
     "not_affiliated": (
-        "<i>Not affiliated with Robinhood or Pons. Not financial advice.</i>",
-        "<i>Не связан с Robinhood и Pons. Не финансовый совет.</i>"),
+        "<i>Not affiliated with Robinhood or vibe/vibe. Not financial advice.</i>",
+        "<i>Не связан с Robinhood и vibe/vibe. Не финансовый совет.</i>"),
     "done": ("✅ Done.", "✅ Готово."),
     "back": ("← Menu", "← Меню"),
     "back_chats": ("← My chats", "← Мои чаты"),
@@ -61,9 +80,9 @@ TEXTS: dict[str, tuple[str, str]] = {
     # ---- welcome messages
     "group_welcome": (
         "👋 Thanks for adding me!\n\n"
-        "I post every buy of your token here, live from Robinhood Chain.\n\n"
+        "I post every buy of your token here, live from Robinhood Chain testnet.\n\n"
         "<b>Setup (admins):</b>\n"
-        "1. /track <code>0xTokenAddress</code> (a Pons launch or any token with a Uniswap pool)\n"
+        "1. /track <code>0xTokenAddress</code> (a vibe/vibe launch)\n"
         "2. /test to preview a post\n"
         "3. /settings to see the options · /lang <code>ru</code> for Russian\n\n"
         "No ads, nothing to buy. /media (reply to a GIF, photo or video) shows it on every buy.\n",
@@ -106,7 +125,10 @@ TEXTS: dict[str, tuple[str, str]] = {
         "/settings — current settings\n"
         "/stats — buys, sells and volume of the last 24 h · /top — the biggest buyers\n"
         "/scan — top 10 holders, snipers, what the dev sold, copy ticker\n"
+        "/promo — a 7-second video of the token to post on X\n"
         "/sells <code>on</code> — post sells too (🔴), <code>off</code> to stop (🚨 dev sells always show)\n"
+        "/digest <code>off</code> — no daily digest (the token's 24 hours at 18:00 UTC)\n"
+        "/alerts <code>off</code> — no private alert to you when the token falls 30% in an hour\n"
         "/chart <code>off</code> — posts without the price chart\n"
         "/lang <code>ru</code> — posts and answers in Russian\n"
         "/minbuy <code>25</code> — skip buys under $25\n"
@@ -121,8 +143,11 @@ TEXTS: dict[str, tuple[str, str]] = {
         "/settings — текущие настройки\n"
         "/stats — покупки, продажи и объём за 24 ч · /top — крупнейшие покупатели\n"
         "/scan — топ-10 держателей, снайперы, что продал дев, тикер-копия\n"
+        "/promo — 7-секундное видео токена для X\n"
         "/sells <code>on</code> — публиковать и продажи (🔴), <code>off</code> — выключить "
         "(🚨 продажи дева видны всегда)\n"
+        "/digest <code>off</code> — без ежедневной сводки (24 часа токена в 18:00 UTC)\n"
+        "/alerts <code>off</code> — без личного алерта, когда токен падает на 30% за час\n"
         "/chart <code>off</code> — посты без графика\n"
         "/lang <code>en</code> — посты и ответы на английском\n"
         "/minbuy <code>25</code> — не публиковать покупки меньше $25\n"
@@ -137,10 +162,10 @@ TEXTS: dict[str, tuple[str, str]] = {
         "Для канала те же команды работают и отсюда (для текущего канала, см. /chats), "
         "и прямо в канале."),
     "home": (
-        "👋 I'm a <b>buy bot for Robinhood Chain</b>.\n\n"
+        "👋 I'm <b>Silverhand Buys</b>, a buy bot on <b>Robinhood Chain testnet</b>.\n\n"
         "Add me to your token's group or channel and I'll post every buy there in real time: "
-        "amount, buyer, market cap and a price chart. Pons launches on the bonding curve and "
-        "after graduation, and any token with a Uniswap v2, v3 or v4 pool.\n\n"
+        "amount, buyer, market cap and a live trade card. Built for vibe/vibe launches: the "
+        "bonding curve, the creator's dev buy, and the Uniswap v4 pool after graduation.\n\n"
         "• No ads and nothing to buy: every chat gets everything\n"
         "• Your own GIF, photo or video on every buy (/media)\n"
         "• Sells too if you want, and stats for your token\n"
@@ -308,6 +333,38 @@ TEXTS: dict[str, tuple[str, str]] = {
                  "📊 MC сейчас <b>{now}</b> · макс. {hi} · мин. {lo}"),
     "stats_change": ("📈 Change: <b>{v}</b>", "📈 Изменение: <b>{v}</b>"),
     "stats_whale": ("🐋 Biggest buy: <b>{v}</b>", "🐋 Крупнейшая покупка: <b>{v}</b>"),
+    "alert_dump": ("📉 <b>{symbol}</b> fell <b>{pct}%</b> in the last hour (tracked in {chat}).\n"
+                   "MC {hi} → <b>{now}</b>\n\n<i>Only you get this: you added the bot there. "
+                   "/alerts off in that chat stops it.</i>",
+                   "📉 <b>{symbol}</b> упал на <b>{pct}%</b> за последний час (отслеживается в {chat}).\n"
+                   "MC {hi} → <b>{now}</b>\n\n<i>Это видите только вы: вы добавили туда бота. "
+                   "/alerts off в том чате выключит такие сообщения.</i>"),
+    "alerts_state": ("Drop alerts are {state}. Usage: /alerts <code>on</code> or /alerts <code>off</code>",
+                     "Алерты о падении {state}. Использование: /alerts <code>on</code> или /alerts <code>off</code>"),
+    "alerts_on": ("✅ Drop alerts on: if the token falls 30% within an hour, the admin who added the bot "
+                  "gets a private message.",
+                  "✅ Алерты о падении включены: если токен упадёт на 30% за час, админ, добавивший бота, "
+                  "получит личное сообщение."),
+    "alerts_off": ("✅ Drop alerts off.", "✅ Алерты о падении выключены."),
+    "set_alerts_on": ("Drop alerts: on, −30% in an hour · /alerts off", "Алерты о падении: вкл, −30% за час · /alerts off"),
+    "set_alerts_off": ("Drop alerts: off · /alerts on", "Алерты о падении: выкл · /alerts on"),
+    "digest_title": ("📅 <b>{symbol}</b> · the last 24 hours", "📅 <b>{symbol}</b> · последние 24 часа"),
+    "digest_buys": ("🟢 {n} {word} · <b>{v}</b>", "🟢 {n} {word} · <b>{v}</b>"),
+    "digest_sells": ("🔴 {n} {word} · <b>{v}</b>", "🔴 {n} {word} · <b>{v}</b>"),
+    "digest_buyers": ("👥 {n} wallets bought", "👥 Покупали кошельков: {n}"),
+    "digest_mc": ("📊 MC <b>{mc}</b>{change}", "📊 MC <b>{mc}</b>{change}"),
+    "digest_top": ("🏆 <b>Top buyers</b>", "🏆 <b>Крупнейшие покупатели</b>"),
+    "digest_state": ("The daily digest is {state}. Usage: /digest <code>on</code> or /digest <code>off</code>",
+                     "Ежедневная сводка {state}. Использование: /digest <code>on</code> или /digest <code>off</code>"),
+    "digest_on": ("✅ Daily digest on: every day at 18:00 UTC, the token's last 24 hours in one post.",
+                  "✅ Ежедневная сводка включена: каждый день в 18:00 UTC итоги токена за 24 часа одним постом."),
+    "digest_off": ("✅ Daily digest off.", "✅ Ежедневная сводка выключена."),
+    "set_digest_on": ("Daily digest: on, 18:00 UTC · /digest off", "Ежедневная сводка: вкл, 18:00 UTC · /digest off"),
+    "set_digest_off": ("Daily digest: off · /digest on", "Ежедневная сводка: выкл · /digest on"),
+    "stats_week": ("<b>Last {d} days</b>", "<b>За последние {d} дн.</b>"),
+    "stats_week_flow": ("🟢 {buys} buys · <b>{bv}</b> · 🔴 {sells} sells · <b>{sv}</b>",
+                        "🟢 {buys} покуп. · <b>{bv}</b> · 🔴 {sells} прод. · <b>{sv}</b>"),
+    "stats_week_mc": ("📊 MC high {hi} · low {lo}{change}", "📊 MC макс. {hi} · мин. {lo}{change}"),
     "stats_posted": ("<b>Posted in this chat</b>\nToday {d} · 7 days {w} · all time {a}",
                      "<b>Опубликовано в этом чате</b>\nСегодня {d} · 7 дней {w} · всего {a}"),
     "stats_no_trades": ("No trades in the last hours yet.", "За последние часы сделок пока нет."),
@@ -358,6 +415,9 @@ TEXTS: dict[str, tuple[str, str]] = {
     "card_curve_full": ("BONDING CURVE", "БОНДИНГ-КРИВАЯ"),
     "post_level_mc": ("🚀🚀🚀\n<b>{symbol}</b> hit <b>{level}</b> market cap!",
                       "🚀🚀🚀\n<b>{symbol}</b>: капитализация достигла <b>{level}</b>!"),
+    "post_level_holders": ("👥👥👥\n<b>{symbol}</b> has <b>{level}</b> holders!",
+                           "👥👥👥\n<b>{symbol}</b>: уже <b>{level}</b> держателей!"),
+    "card_holders": ("HOLDERS", "ДЕРЖАТЕЛИ"),
     "post_level_curve": ("🎓 <b>{symbol}</b>: the bonding curve is <b>{pct}%</b> full\n{bar}",
                          "🎓 <b>{symbol}</b>: бондинг-кривая заполнена на <b>{pct}%</b>\n{bar}"),
     "whale_usage": ("Buys from {v} get the 🐋 mark. Usage: /whale <code>1000</code> (dollars, 0 turns it off)",
@@ -414,6 +474,51 @@ TEXTS: dict[str, tuple[str, str]] = {
             "{symbol} · за {h} ч\n🟢 {buys} {bw} · {bv}\n🔴 {sells} {sw} · {sv}\n"
             "📊 MC {mc} · {change}\n⬆ {hi} · ⬇ {lo}"),
     "pop_none": ("{symbol}: no trades in the last hours yet.", "{symbol}: за последние часы сделок пока нет."),
+
+    # ---- /promo: a short video of a vibe/vibe launch for X
+    "promo_usage": ("🎬 Send a vibe/vibe token's contract address: /promo <code>0x…</code>\n"
+                    "I'll make a 7-second video of it to post on X, in a style you pick. "
+                    "Or name the style: /promo <code>0x…</code> terminal\n"
+                    "Styles: dashboard, kinetic, terminal, ticket, gauge, lime.",
+                    "🎬 Отправьте адрес контракта токена vibe/vibe: /promo <code>0x…</code>\n"
+                    "Я сделаю 7-секундное видео о нём для X в стиле, который вы выберете. "
+                    "Или назовите стиль сразу: /promo <code>0x…</code> terminal\n"
+                    "Стили: dashboard, kinetic, terminal, ticket, gauge, lime."),
+    "promo_pick": ("🎬 Pick a style for the video of <code>{token}</code>. The clips above are samples, "
+                   "numbered as the buttons; your video will have this token's own logo and numbers.",
+                   "🎬 Выберите стиль видео для <code>{token}</code>. Ролики выше — примеры, номера как "
+                   "на кнопках; в вашем видео будут логотип и цифры этого токена."),
+    "promo_pick_old": ("This menu has expired. Send /promo again.",
+                       "Это меню устарело. Отправьте /promo ещё раз."),
+    "promo_pick_owner": ("Only the person who asked can pick the style. Send your own /promo.",
+                         "Выбрать стиль может только тот, кто спросил. Отправьте свой /promo."),
+    "promo_not_vibe": ("❌ /promo works for vibe/vibe launches on Robinhood Chain testnet.",
+                       "❌ /promo работает для запусков vibe/vibe в Robinhood Chain testnet."),
+    "promo_failed": ("❌ I couldn't read this launch right now. Try again in a minute.",
+                     "❌ Сейчас не получилось прочитать этот запуск. Попробуйте через минуту."),
+    "promo_render_failed": ("❌ The video could not be made. Try again later.",
+                            "❌ Видео не получилось. Попробуйте позже."),
+    "promo_busy": ("⏳ A few videos are being made right now. Try again in a minute.",
+                   "⏳ Сейчас делается несколько видео. Попробуйте через минуту."),
+    "promo_wait": ("⏳ Not so fast, please: try again in {wait}.",
+                   "⏳ Не так часто, пожалуйста: попробуйте через {wait}."),
+    "promo_making": ("🎬 Reading the launch and making its {style} video, about half a minute…",
+                     "🎬 Читаю запуск и делаю видео в стиле {style}, около полуминуты…"),
+    "promo_caption": (
+        "🎬 <b>${symbol}</b> on vibe/vibe: a 7-second video for X\n\n{facts}\n"
+        "<i>Read from the chain and vibe/vibe at {time} UTC.</i>\n\n"
+        "Save the video and post it. Text to go with it (tap to copy):\n<code>{post}</code>",
+        "🎬 <b>${symbol}</b> на vibe/vibe: 7-секундное видео для X\n\n{facts}\n"
+        "<i>Данные с чейна и vibe/vibe на {time} UTC.</i>\n\n"
+        "Сохраните видео и опубликуйте. Текст к нему (нажмите, чтобы скопировать):\n<code>{post}</code>"),
+    "promo_curve": ("🎓 Curve {pct}", "🎓 Кривая {pct}"),
+    "promo_graduated": ("🎓 Graduated to Uniswap v4", "🎓 Перешёл на Uniswap v4"),
+    "promo_mc": ("📊 MC {mc}", "📊 Капитализация {mc}"),
+    "promo_holders": ("👥 {n} holders", "👥 Держателей: {n}"),
+    "promo_buys": ("🟢 {n} buys in 24 h", "🟢 Покупок за 24 ч: {n}"),
+    # the suggested X post: facts only (no price talk), in English for X
+    "promo_post": ("${symbol} on vibe/vibe, Robinhood Chain testnet: {facts}.\nCA {token}",
+                   "${symbol} on vibe/vibe, Robinhood Chain testnet: {facts}.\nCA {token}"),
 
     # ---- /scan and the 🛡 Scan button
     "btn_scan": ("🛡 Scan", "🛡 Скан"),

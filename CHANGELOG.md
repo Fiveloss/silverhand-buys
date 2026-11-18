@@ -1,6 +1,26 @@
 # Changelog
 
-## 0.5.0
+## Unreleased
+
+### 1.0.0-rc.1 stability work
+
+- Bounded chat workers keep a slow card from blocking the other chats. A busy
+  renderer falls back to text; identical completed cards are briefly reused.
+  Render cancellation keeps the memory slot until work ends, and ffmpeg pipes
+  and subprocesses are cleaned up after errors.
+- Private alerts retry temporary failures with persistent deadlines and share
+  the sender's rate limiter. Blocked users do not accumulate retries.
+- Milestones, holder thresholds and digests persist their queue entries and
+  markers atomically, so failed writes do not consume an event.
+- Startup checks the configured network and labels the database. Legacy databases
+  require a one-time `DB_CHAIN_ID` confirmation; cross-network reuse is refused.
+- Mainnet hides testnet-only promo actions. Mini App labels, holder posts and
+  milestone themes follow their network and launchpad.
+- Health checks distinguish RPC responses, advancing blocks, processing, delivery
+  and queue age; stopped background tasks notify owners. Unchanged incidents stay quiet.
+- `tools/check_public.py` checks a candidate export and runs both offline suites
+  without publication. Internal rollout documents are excluded; public Mini App
+  setup is in `docs/MINIAPP-SETUP.md`.
 
 - 🚨 DEV SELL: when the token's creator (the Pons deployer, the Flap or pool token's
   creator) sells, the post is marked DEV SELL and its wallet line says how much of the

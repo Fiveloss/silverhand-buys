@@ -9,17 +9,19 @@
 - Buys older than `max_age` seconds (after downtime) are dropped, not posted late.
 - Each buy or sell goes out as a price chart with the text as its caption: animated
   (a looping MP4 Telegram plays like a GIF) or, with /chart still, a picture. A chat
-  with charts off, or showing its own media (/media), gets no chart; without one, text.
+  with charts off, or showing its own media (/media), gets no chart; a busy renderer
+  also falls back to text so other chats can send promptly.
 - Every post ends the same way in every chat: no ad, no promotion.
 """
 
 import asyncio
+import json
 import logging
 import os
 import time
 
 from aiogram import Bot
-from aiogram.exceptions import (TelegramBadRequest, TelegramForbiddenError,
+from aiogram.exceptions import (TelegramAPIError, TelegramBadRequest, TelegramForbiddenError,
                                 TelegramMigrateToChat, TelegramNetworkError,
                                 TelegramRetryAfter, TelegramServerError)
 from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup
@@ -29,6 +31,9 @@ from .db import Chat, Db, OutboxRow
 from .i18n import t
 
 CHART_HOURS = 6
+# The testnet bot draws milestones on the trade card too (the main bot keeps chart.py's
+# animation for them): one look for every post.
+MILESTONE_CARDS = True
 # The trade card's frame rate. 30 by default: on the server (one core, a 30% CPU quota) a
 # 60 fps card takes ~30 s to draw, 30 fps ~13 s. CHART_FPS=60 where there is CPU to spare.
 CARD_FPS = int(os.environ.get("CHART_FPS", "30"))
@@ -49,15 +54,20 @@ def keyboard(pairs: list[tuple], ids: dict[str, str] | None = None) -> InlineKey
     leading emoji becomes the badge icon of the button."""
     if not pairs:
         return None
-    row = []
-    for label, v, *rest in pairs:
+    rows, row = [], []
+    for item in pairs:
+        if item is None:  # a new row
+            rows.append(row)
+            row = []
+            continue
+        label, v, *rest = item
         text, icon = emoji.split_icon(label, ids)
         extra = {"style": rest[0]} if rest and rest[0] else {}
         if icon:
             extra["icon_custom_emoji_id"] = icon
         row.append(InlineKeyboardButton(text=text, url=v, **extra) if v.startswith("https://") else
                    InlineKeyboardButton(text=text, callback_data=v, **extra))
-    return InlineKeyboardMarkup(inline_keyboard=[row])
+    return InlineKeyboardMarkup(inline_keyboard=[r for r in rows + [row] if r])
 
 
 async def send_post(bot: Bot, chat: Chat, text: str, pairs: list[tuple],
@@ -112,12 +122,15 @@ def trade_amount(p: dict, side: int) -> str:
     """What rises above the candle: +$8.02 for a buy, −$3.79 for a sell."""
     sign = "+" if side > 0 else "−"
     if p.get("usd") is not None:
-        return sign + render.fmt_usd(p["usd"])
+        return sign + ("~" if p.get("usd_approx") else "") + render.fmt_usd(p["usd"])
     return f"{sign}{render.fmt_num(p['quote'])} {p.get('quote_symbol', '')}".strip()
 
 
 def card_text(p: dict, side: int, symbol: str, lang: str) -> dict:
     """The animated card's words: the title, the big number and the line under it."""
+    if p.get("what") == "holders":
+        return {"title": f"{symbol} {t(lang, 'card_holders')}", "amount": p["chart_label"],
+                "detail": t(lang, "card_holders")}
     if p.get("what"):  # a milestone
         mc = p["what"] == "mc"
         return {"title": f"{symbol} {'MC' if mc else t(lang, 'card_curve')}", "amount": p["chart_label"],
@@ -137,9 +150,9 @@ def venue_label(token, p: dict) -> str:
 
 
 def graduation_mc(token) -> float | None:
-    """A Pons curve token's market cap at graduation, in its quote: the curve's reserves when
-    the real quote reaches the threshold (constant product over the virtual reserve)."""
-    if getattr(token, "kind", "pons") != "pons" or token.graduated or not token.curve_k \
+    """A Pons or vibe/vibe curve token's market cap at graduation, in its quote: the curve's
+    reserves when the real quote reaches the threshold (constant product over the virtual reserve)."""
+    if getattr(token, "kind", "pons") not in ("pons", "vibe") or token.graduated or not token.curve_k \
             or token.phantom is None or not token.threshold:
         return None
     q = token.phantom + token.threshold
@@ -161,10 +174,11 @@ def card_spec(db: Db, token, p: dict, side: int, usd_per_quote: float | None,
     first = points[0][1] if points else None
     last = p.get("price") or (points[-1][1] if points else None)
     return {
-        "theme": "vibe" if p.get("launchpad") == "vibe/vibe" else "silverhand",
+        "theme": "vibe" if p.get("launchpad") == "vibe/vibe" or "testnet" in (p.get("network") or "")
+                 else "silverhand",
         "side": side, "symbol": token.symbol, "name": token.name,
         "network": p.get("network") or "Robinhood Chain", "venue": venue_label(token, p),
-        "usd": p.get("usd"), "quote": p.get("quote"), "quote_symbol": p.get("quote_symbol") or token.quote_symbol,
+        "usd": p.get("usd"), "usd_approx": bool(p.get("usd_approx")), "quote": p.get("quote"), "quote_symbol": p.get("quote_symbol") or token.quote_symbol,
         "tokens": p.get("tokens"), "mc_usd": p.get("mc_usd"), "mc_quote": p.get("mc_quote"),
         "price_change": (last / first - 1) if first and last else None, "progress": p.get("progress"),
         "buyer": render.short_addr(p["buyer"]) if p.get("buyer") else None, "holder": p.get("holder"),
@@ -179,16 +193,25 @@ def card_spec(db: Db, token, p: dict, side: int, usd_per_quote: float | None,
 
 
 async def make_chart(db: Db, p: dict, side: int, mode: int = CHART_ANIMATED,
-                     lang: str = "en", whale_usd: float = 0) -> tuple[bytes, str] | None:
+                     lang: str = "en", whale_usd: float = 0, *,
+                     wait: bool = True) -> tuple[bytes, str] | None:
     """The card for a trade payload as (bytes, kind), or None (charts off, no Pillow,
     a failure). An animation that cannot be made falls back to a picture. Milestones
     keep the older chart. Drawing runs off the event loop, one card at a time
     (heavy.slot), and its memory goes back to the system after."""
     if mode == CHART_OFF:
         return None
-    async with heavy.slot():
+    async with heavy.slot(wait=wait) as acquired:
+        if not acquired:
+            return None
+        # Cancelling to_thread does not stop its worker. Keep the memory slot until
+        # rendering actually finishes, including during shutdown.
+        task = asyncio.create_task(_make_chart(db, p, side, mode, lang, whale_usd))
         try:
-            return await _make_chart(db, p, side, mode, lang, whale_usd)
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task
+            raise
         finally:
             heavy.release()
 
@@ -206,10 +229,12 @@ async def _make_chart(db: Db, p: dict, side: int, mode: int, lang: str,
         usd_per_quote = p["usd"] / p["quote"] if p.get("usd") and p.get("quote") else None
     if usd_per_quote is None and token.quote_kind == "usd":
         usd_per_quote = 1.0
-    if not p.get("what"):  # a trade: the dashboard card
+    if not p.get("what") or MILESTONE_CARDS:  # a trade, or a milestone: the card
         try:
             from . import card
             spec = card_spec(db, token, p, side, usd_per_quote, whale_usd)
+            if p.get("what"):
+                spec["milestone"] = {"what": p["what"], "level": p["level"]}
             if mode == CHART_ANIMATED:
                 try:
                     return await asyncio.to_thread(card.render_card, spec, fps=CARD_FPS), "animation"
@@ -250,20 +275,35 @@ class Sender:
         self.max_age = max_age
         self._next_chat: dict[int, float] = {}
         self._next_global = 0.0
+        self._rate_lock = asyncio.Lock()
+        self._flush_lock = asyncio.Lock()
+        self._chart_cache = None  # one completed card, shared across chats for 30 seconds
         self.sent = 0
         self.dropped = 0
+        self.last_ok = time.time()
+        self.last_sent: float | None = None
+        self.last_error: str | None = None
 
     async def run(self) -> None:
         while True:
             try:
                 await self.flush()
+                self.last_ok = time.time()
+                self.last_error = None
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as e:
+                self.last_error = f"{type(e).__name__}: {e}"
                 log.exception("sender flush failed")
             await asyncio.sleep(0.5)
 
     async def flush(self) -> int:
+        # Only one worker may own a chat's outbox rows, even if a caller triggers a
+        # flush while the run loop is already flushing.
+        async with self._flush_lock:
+            return await self._flush()
+
+    async def _flush(self) -> int:
         now = time.time()
         rows = self.db.pending_outbox(2000)
         stale = [r.id for r in rows if now - r.created_at > self.max_age]
@@ -275,36 +315,78 @@ class Sender:
         by_chat: dict[int, list[OutboxRow]] = {}
         for r in rows:
             by_chat.setdefault(r.chat_id, []).append(r)
-        sent = 0
-        for chat_id, items in by_chat.items():
-            if self._next_chat.get(chat_id, 0) > time.time():
-                continue
-            chat = self.db.get_chat(chat_id)
-            if chat is None or not chat.active:
-                self.db.delete_outbox([r.id for r in items])
-                continue
-            if await self._post(chat, items):
-                sent += 1
-        return sent
+        queue = iter(by_chat.items())
+
+        async def worker():
+            sent = 0
+            for chat_id, items in queue:
+                sent += await self._flush_chat(chat_id, items)
+            return sent
+
+        # Bounded workers, rather than a task for every chat. A slow renderer or
+        # Telegram request in one chat leaves the others able to send.
+        workers = [asyncio.create_task(worker()) for _ in range(min(8, len(by_chat)))]
+        try:
+            return sum(await asyncio.gather(*workers))
+        finally:
+            for task in workers:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+
+    async def _flush_chat(self, chat_id: int, items: list[OutboxRow]) -> int:
+        if self._next_chat.get(chat_id, 0) > time.time():
+            return 0
+        alerts = [r for r in items if r.kind == "alert"]
+        if alerts:  # private alerts have no chat row of their own
+            await self._alert(chat_id, alerts)
+            return 0  # one send per chat this pass, including mixed private queues
+        chat = self.db.get_chat(chat_id)
+        if chat is None or not chat.active:
+            self.db.delete_outbox([r.id for r in items])
+            return 0
+        if await self._post(chat, items):
+            return 1
+        return 0
+
+    async def _throttle(self, chat_id: int) -> None:
+        async with self._rate_lock:
+            wait = self._next_global - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._next_global = time.monotonic() + self.global_interval
+            self._next_chat[chat_id] = time.time() + self.chat_interval
 
     def _compose(self, chat: Chat, items: list[OutboxRow]):
+        digests = [r for r in items if r.kind == "digest"]
+        if digests:  # the daily digest: text only, the latest if several waited
+            batch = [digests[-1]]
+            self.db.delete_outbox([r.id for r in digests[:-1]])
+            p = batch[0].payload
+            return batch, render.digest_text(p, chat.lang), render.buttons(p, self.trade_url, self.explorer), \
+                False, None
         grads = [r for r in items if r.kind == "grad"]
         if grads:
             batch = [grads[0]]
-            p = grads[0].payload
+            p = dict(grads[0].payload)
             text = render.graduation_text(p, chat.lang)
-            pairs = render.buttons({"token": p["token"], "tx": p.get("tx")},
-                                   self.trade_url, self.explorer)
-            return batch, text, pairs, False, None
+            pairs = render.buttons(p, self.trade_url, self.explorer, render.share_text(p, "grad"))
+            # the card says it too: GRADUATED, what the curve raised, the pool it opened
+            p["what"], p["level"] = "grad", p.get("usd") if p.get("usd") is not None else p.get("raised")
+            return batch, text, pairs, False, (p, 1)
         levels = [r for r in items if r.kind == "milestone" and r.payload.get("token") == chat.token]
         if levels:
-            batch = [levels[-1]]  # several at once: the highest says it all
-            self.db.delete_outbox([r.id for r in levels[:-1]])
+            # several of one kind at once: the highest says it all; another kind goes next
+            what = levels[-1].payload.get("what")
+            same = [r for r in levels if r.payload.get("what") == what]
+            batch = [same[-1]]
+            self.db.delete_outbox([r.id for r in same[:-1]])
             p = dict(batch[0].payload)
             text = render.milestone_text(p, chat.lang)
-            pairs = render.buttons({"token": p["token"], "tx": p.get("tx")}, self.trade_url, self.explorer)
+            pairs = render.buttons(p, self.trade_url, self.explorer, render.share_text(p, "milestone"))
             # what rises over the chart (its font has no emoji): $50K, or 75% for the curve
             p["chart_label"] = (render.fmt_usd(p["level"]) if p["what"] == "mc"
+                                else f"{p['level']:,}" if p["what"] == "holders"
                                 else f"{round(p['level'] * 100)}%")
             return batch, text, pairs, False, (p, 1)
         token = chat.token
@@ -326,7 +408,8 @@ class Sender:
         batch = [r for r in items if r.kind == kind]
         main, more = render.pick_main([r.payload for r in batch])
         text = render.buy_text(main, chat, more, explorer=self.explorer, sell=kind == "sell")
-        pairs = render.buttons(main, self.trade_url, self.explorer)
+        pairs = render.buttons(main, self.trade_url, self.explorer,
+                               render.share_text(main, kind) if kind == "buy" else None)
         return batch, text, pairs, True, (main, -1 if kind == "sell" else 1)
 
     async def _post(self, chat: Chat, items: list[OutboxRow]) -> bool:
@@ -335,16 +418,30 @@ class Sender:
             return False
         chart = None
         if trade and wants_chart(chat, with_media):
-            chart = await make_chart(self.db, *trade, mode=chat.chart, lang=chat.lang,
-                                     whale_usd=chat.whale_usd)
+            key = json.dumps([trade, chat.chart, chat.lang, chat.whale_usd], sort_keys=True)
+            cached = self._chart_cache
+            if cached and cached[0] == key and time.monotonic() - cached[1] < 30:
+                chart = cached[2]
+            else:
+                # Never queue behind a promo or another live card: send text when
+                # the sole memory-heavy renderer is occupied.
+                chart = await make_chart(self.db, *trade, mode=chat.chart, lang=chat.lang,
+                                         whale_usd=chat.whale_usd, wait=False)
+                if chart:
+                    self._chart_cache = (key, time.monotonic(), chart)
+        # Rendering took time: /untrack, /track or settings may have changed in
+        # the meantime. Leave the rows for the next flush to compose afresh.
+        if self.db.get_chat(chat.chat_id) != chat:
+            return False
+        expired = [r.id for r in batch if time.time() - r.created_at > self.max_age]
+        if expired:
+            self.db.delete_outbox(expired)
+            self.dropped += len(expired)
+            return False
         ids = [r.id for r in batch]
         text += render.footer()
 
-        wait = self._next_global - time.monotonic()
-        if wait > 0:
-            await asyncio.sleep(wait)
-        self._next_global = time.monotonic() + self.global_interval
-        self._next_chat[chat.chat_id] = time.time() + self.chat_interval
+        await self._throttle(chat.chat_id)
         try:
             await send_post(self.bot, chat, text, pairs, with_media, chart, emoji.load(self.db))
         except TelegramRetryAfter as e:
@@ -380,11 +477,44 @@ class Sender:
             return False
         self.db.delete_outbox(ids)
         self.sent += 1
+        self.last_sent = time.time()
         kinds = {r.kind for r in batch}
         if kinds <= {"buy", "sell"}:
             self.db.add_chat_stat(chat.chat_id, batch[0].kind, len(batch),
                                   sum(r.payload.get("usd") or 0 for r in batch))
         return True
+
+    async def _alert(self, user_id: int, rows: list[OutboxRow]) -> None:
+        """Send one private alert, keeping temporary failures for a later attempt."""
+        r = rows[0]
+        await self._throttle(user_id)
+        try:
+            await self.bot.send_message(user_id, render.alert_text(r.payload))
+        except TelegramRetryAfter as e:
+            until = time.time() + e.retry_after + 1
+            self._next_chat[user_id] = until
+            self.db.defer_outbox([row.id for row in rows], until)
+            log.warning("alert flood wait %ss for %s", e.retry_after, user_id)
+        except TelegramForbiddenError:
+            self.db.delete_outbox([row.id for row in rows])
+            self.dropped += len(rows)
+            log.info("cannot deliver private alerts to %s", user_id)
+        except TelegramBadRequest as e:
+            if any(h in e.message.lower() for h in _GONE):
+                self.db.delete_outbox([row.id for row in rows])
+                self.dropped += len(rows)
+            else:
+                self._drop_after_retries([r])
+            log.warning("bad alert request for %s: %s", user_id, e)
+        except TelegramAPIError as e:
+            until = time.time() + min(60, 5 * 2 ** min(r.attempts, 4))
+            self._next_chat[user_id] = until
+            self.db.defer_outbox([row.id for row in rows], until)
+            log.warning("alert to %s deferred: %s", user_id, e)
+        else:
+            self.db.delete_outbox([r.id])
+            self.sent += 1
+            self.last_sent = time.time()
 
     def _drop_after_retries(self, batch: list[OutboxRow]) -> None:
         dead = [r.id for r in batch if r.attempts >= 2]

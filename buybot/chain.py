@@ -19,6 +19,11 @@ from . import abi
 from .keccak import keccak256
 
 CHAIN_ID = 4663
+TESTNET_CHAIN_ID = 46630
+NETWORKS = {CHAIN_ID: "Robinhood Chain", TESTNET_CHAIN_ID: "Robinhood Chain testnet"}
+# Blocks a second, for estimates only (block times are read where they matter): a block
+# about every 0.1 s on mainnet; testnet made 8.85 a second over the day to 2026-10-16.
+BLOCK_RATES = {CHAIN_ID: 10.0, TESTNET_CHAIN_ID: 8.85}
 
 PONS_FACTORY = "0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e"
 PONS_HOOK = "0xe5e702641ea86f4ae6cc3cdaed2b886f976be044"
@@ -26,6 +31,63 @@ POOL_MANAGER = "0x8366a39cc670b4001a1121b8f6a443a643e40951"
 NATIVE = abi.ZERO_ADDRESS
 
 # The quote assets the bot can value in dollars are listed in quotes.py.
+
+
+@dataclass(frozen=True)
+class VibeContracts:
+    """One vibe/vibe factory (vibe.py): the factory whose LaunchCreated names each curve,
+    the hook of the Uniswap v4 pools its curves graduate into, and its router (it calls
+    the curves for buyers, so it is never the buyer; "" where buyers call the curve).
+
+    gen: "v6" for the taxed factory (tax in tokens, its own event layouts), "curve" for
+    the curve factory (fee in the quote only). from_block: where a token-filtered search
+    for its launches may stop. quotes: (graduation target, quote) for a factory whose
+    launch event does not name the quote: each quote asset has its own target."""
+    factory: str
+    hook: str
+    router: str
+    gen: str = "v6"
+    from_block: int = 0
+    quotes: tuple[tuple[int, str], ...] = ()
+
+
+# Testnet only so far (docs/VIBE-VIBE.md); on mainnet the vibe path stays off until
+# vibe/vibe launches there and its addresses are known. The curve factory is the one
+# vibe/vibe's own config names (/api/v1/chains/46630/config, 2026-10-19: 5 ETH target,
+# 1.25% fee, SPCX as the second quote asset); both launch a few hundred tokens a day.
+VIBE = {
+    TESTNET_CHAIN_ID: (
+        VibeContracts(
+            factory="0xe794217880011f9ca6961340ed5c16ec9559fea0",
+            hook="0xa5e27e3e54739162fe52c2c48e55b6dd6572e8ec",
+            router="0x2784448c519d01d3ae257c0aac0b7cdad8acceb1",
+        ),
+        VibeContracts(
+            factory="0x40f1be6faf8dab9c143cce1a0a04c2075fb2df59",
+            hook="0x2779651fee12f6fb5a187578de6b63709f85d0cc",
+            router="",
+            gen="curve",
+            from_block=100_000_000,
+            quotes=((5 * 10 ** 18, NATIVE),
+                    (82_740_374_439_909_720_323, "0x5a5398155d98374c0e26265ea3cb9818169c2739")),  # SPCX
+        ),
+    ),
+}
+
+
+def vibe_contracts(chain_id: int | None) -> tuple[VibeContracts, ...]:
+    """Every vibe/vibe factory on the chain, oldest first; () where there is none."""
+    return VIBE.get(chain_id, ()) if chain_id is not None else ()
+
+
+def vibe_factory(address: str) -> VibeContracts | None:
+    """The vibe/vibe factory at this address, on any chain."""
+    address = address.lower()
+    return next((c for cs in VIBE.values() for c in cs if c.factory == address), None)
+
+
+def network(chain_id: int | None) -> str:
+    return NETWORKS.get(chain_id if chain_id is not None else CHAIN_ID, f"chain {chain_id}")
 
 # --- event topics (each equals keccak256 of the signature in its comment) ---
 # TokenLaunched(address indexed token, address indexed curve, address indexed deployer,

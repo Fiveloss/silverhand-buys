@@ -14,7 +14,7 @@ import time
 import unittest
 from pathlib import Path
 
-from buybot import abi, chain, emoji, flap, pools, quotes, render
+from buybot import abi, chain, emoji, flap, pools, quotes, render, vibe
 from buybot.config import load_dotenv
 from buybot.db import Chat, Db, Token
 from buybot.keccak import keccak256
@@ -36,6 +36,11 @@ POOLS = json.loads((Path(__file__).parent / "fixtures" / "pools_mainnet.json").r
 # Flap.sh: a curve buy with its progress change, a sell, a graduation into a v2 pair,
 # getTokenV7, and direct buys' transaction values next to the event's `eth`.
 FLAP = json.loads((Path(__file__).parent / "fixtures" / "flap_mainnet.json").read_text())
+# vibe/vibe V6 on testnet: a launch, its curve's whole life up to graduation, a curve quoted
+# in another token, and a curve's views right before and after one trade.
+VIBE = json.loads((Path(__file__).parent / "fixtures" / "vibe_v6_testnet.json").read_text())
+# vibe/vibe's curve factory: one curve's life (every trade in `replay`) and a live launch.
+VIBE_C = json.loads((Path(__file__).parent / "fixtures" / "vibe_curve_testnet.json").read_text())
 TOKEN = FIX["launch"]["token"]
 CURVE = FIX["launch"]["curve"]
 DEPLOYER = FIX["launch"]["deployer"]
@@ -475,6 +480,29 @@ class RpcBatch(unittest.TestCase):
 class Memory(unittest.TestCase):
     """The bot runs under a 300 MB cap: cards are drawn one at a time and keep no 2x canvas."""
 
+    @needs("PIL")
+    def test_failed_frames_stop_ffmpeg_and_close_its_pipes(self):
+        import io
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+        from buybot import card, promo_video
+        for module, factory, invoke in (
+                (card, "Card", lambda: card.render_card({}, fps=1, seconds=1)),
+                (promo_video, "video", lambda: promo_video.render({}, fps=1, seconds=1))):
+            with self.subTest(renderer=module.__name__):
+                proc = SimpleNamespace(stdin=io.BytesIO(), stderr=io.BytesIO(),
+                                       poll=Mock(return_value=None), kill=Mock(), wait=Mock(return_value=0))
+                broken = SimpleNamespace(W=2, H=2, frame=Mock(side_effect=RuntimeError("bad frame")))
+                with patch.object(module, factory, return_value=broken), \
+                        patch.object(module, "_ffmpeg", return_value="ffmpeg"), \
+                        patch.object(module.subprocess, "Popen", return_value=proc):
+                    with self.assertRaisesRegex(RuntimeError, "bad frame"):
+                        invoke()
+                proc.kill.assert_called_once()
+                proc.wait.assert_called_once_with(timeout=5)
+                self.assertTrue(proc.stdin.closed)
+                self.assertTrue(proc.stderr.closed)
+
     @needs("aiogram", "PIL")
     def test_cards_are_drawn_one_at_a_time(self):
         from buybot import card, sender
@@ -551,6 +579,25 @@ class Storage(unittest.TestCase):
         self.assertEqual(self.db.commit_tick(rows, 11), 0)
         self.assertEqual(self.db.last_block(), 11)
         self.assertEqual(self.db.outbox_size(), 1)
+
+    def test_event_markers_and_posts_rollback_together(self):
+        import sqlite3
+        self.db.set_last_block(9)
+        # Fail after the posts and trades were inserted, when persisting the marker.
+        self.db.conn.execute("CREATE TEMP TRIGGER fail_marker BEFORE INSERT ON meta "
+                             "WHEN NEW.key='level:mc:token' BEGIN SELECT RAISE(ABORT, 'disk failure'); END")
+        rows = [(-1, "milestone", "level:1", {"level": 1})]
+        trades = [(TOKEN, "tx:1", 100, 1e-8, 0.1, 1)]
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.commit_tick(rows, 10, trades=trades, meta_updates={"level:mc:token": "1"})
+        self.assertEqual(self.db.last_block(), 9)
+        self.assertEqual(self.db.outbox_size(), 0)
+        self.assertEqual(self.db.trades_since(TOKEN, 0), [])
+        self.assertIsNone(self.db.get_meta("level:mc:token"))
+        self.db.conn.execute("DROP TRIGGER fail_marker")
+        self.assertEqual(self.db.commit_tick(rows, 10, trades=trades,
+                                             meta_updates={"level:mc:token": "1"}), 1)
+        self.assertEqual(self.db.get_meta("level:mc:token"), "1")
 
     def test_the_paid_plan_leaves_a_database_from_before_it(self):
         """A 0.3 database: empty ads and payments tables go, chats.pro_until stays (older
@@ -629,6 +676,27 @@ class Storage(unittest.TestCase):
         self.db.ensure_chat(-1)
         with self.assertRaises(ValueError):
             self.db.update_chat(-1, bogus=1)
+
+    def test_database_cannot_be_reused_for_another_network(self):
+        self.db.bind_chain(46630)
+        self.db.bind_chain(46630)
+        with self.assertRaises(ValueError):
+            self.db.bind_chain(4663, legacy_chain_id=4663)
+        self.assertEqual(self.db.get_meta("chain_id"), "46630")
+
+    def test_legacy_network_confirmation_preserves_data(self):
+        self.db.ensure_chat(-1, "Existing chat")
+        self.db.upsert_token(fixture_token())
+        self.db.set_last_block(123)
+        with self.assertRaises(ValueError):
+            self.db.bind_chain(4663)
+        with self.assertRaises(ValueError):
+            self.db.bind_chain(4663, legacy_chain_id=46630)
+        self.assertIsNone(self.db.get_meta("chain_id"))
+        self.db.bind_chain(4663, legacy_chain_id=4663)
+        self.assertEqual(self.db.get_chat(-1).title, "Existing chat")
+        self.assertEqual(self.db.get_token(TOKEN).address, TOKEN)
+        self.assertEqual(self.db.last_block(), 123)
 
 
 class FakeRpc:
@@ -886,7 +954,10 @@ class WatcherTicks(unittest.TestCase):
                                                    "quote": 0.01, "tx": "0x" + "ab" * 32})
 
         def levels(*events):
-            return [(e[5]["what"], e[5]["level"]) for e in w._milestones(list(events))]
+            updates = {}
+            out = [(e[5]["what"], e[5]["level"]) for e in w._milestones(list(events), updates)]
+            self.db.queue_events([], updates)
+            return out
 
         self.assertEqual(levels(ev("buy", 12_000, 0.52)), [])  # the first trade only sets the base
         self.assertEqual(levels(ev("buy", 27_000, 0.6)), [("mc", 25_000)])
@@ -894,6 +965,31 @@ class WatcherTicks(unittest.TestCase):
         self.assertEqual(levels(ev("buy", 60_000, 0.91)), [("mc", 50_000), ("curve", 0.9)])
         self.assertEqual(levels(ev("sell", 120_000)), [])  # sells never post one
         self.assertEqual(levels(ev("buy", 110_000)), [])   # but the sell set the new high
+
+    def test_failed_tick_does_not_consume_milestones(self):
+        from unittest.mock import AsyncMock, patch
+        self.db.set_last_block(self.first_block - 1)
+        w = self.watcher(FakeRpc(self.last_block, self.buys))
+        key = f"level:mc:{TOKEN}"
+        with patch.object(w, "_about_traders", new=AsyncMock(side_effect=RuntimeError("RPC failed"))):
+            with self.assertRaises(RuntimeError):
+                run(w.tick())
+        self.assertIsNone(self.db.get_meta(key))
+        self.assertEqual(self.db.last_block(), self.first_block - 1)
+        self.assertEqual(self.db.outbox_size(), 0)
+        run(w.tick())
+        self.assertIsNotNone(self.db.get_meta(key))
+        self.assertGreater(self.db.outbox_size(), 0)
+
+    def test_static_rpc_head_is_distinct_from_a_successful_poll(self):
+        from unittest.mock import patch
+        w = self.watcher(FakeRpc(self.last_block, []))
+        with patch("buybot.watcher.time.time", return_value=1000):
+            run(w.tick())
+        with patch("buybot.watcher.time.time", return_value=1400):
+            run(w.tick())
+        self.assertEqual(w.last_rpc_ok, 1400)
+        self.assertEqual(w.last_head_change, 1000)
 
     def test_nothing_tracked_just_advances(self):
         self.db.update_chat(-1, token=None)
@@ -1265,7 +1361,7 @@ class FlapLaunches(unittest.TestCase):
                            curve_k=None, phantom=None, graduated=False, added_at=0, kind="flap")
         self.db.upsert_token(self.token)
         self.db.ensure_chat(-1)
-        self.db.update_chat(-1, token=FLAP["token"], sells=1)
+        self.db.update_chat(-1, token=FLAP["token"], sells=1, min_usd=0)  # every trade, however small
 
     def tearDown(self):
         self.db.close()
@@ -1592,6 +1688,586 @@ class TokenScan(unittest.TestCase):
         self.assertIn("✅ Ticker: no older $TST", render.scan_text(s))
 
 
+def _transfers(logs: list[dict], token: str) -> list[tuple[str, str, int]]:
+    return [(abi.topic_address(lg["topics"][1]), abi.topic_address(lg["topics"][2]), int(lg["data"], 16))
+            for lg in logs if lg["address"] == token and lg["topics"][0] == chain.TOPIC_TRANSFER]
+
+
+def vibe_state(views: dict) -> vibe.State:
+    num = {k: int(v, 16) for k, v in views.items()}
+    return vibe.decode_state("0x" + views["token"][-40:], "0x" + views["quote"][-40:], num["target"],
+                             num["real_quote"], num["tokens_left"], num["tokens_sold"], num["complete"],
+                             views["pool_id"])
+
+
+class VibeDecoding(unittest.TestCase):
+    """Field meanings checked against the token Transfers of the same transactions."""
+
+    def test_topics_and_selectors(self):
+        for topic, sig in [(vibe.TOPIC_CURVE_BUY, "CurveBuy(address,address,uint256,uint256,uint256,uint256,uint256,uint256)"),
+                           (vibe.TOPIC_CURVE_SELL, "CurveSell(address,address,uint256,uint256,uint256,uint256,uint256)"),
+                           (vibe.TOPIC_INITIAL_PURCHASE, "InitialPurchase(address,uint256,uint256,uint256,uint256)"),
+                           (vibe.TOPIC_GRADUATED, "Graduated(bytes32,uint256,uint256,uint256)")]:
+            self.assertEqual(topic, abi.event_topic(sig))
+        for sel, sig in [(vibe.SEL_TOKEN, "token()"), (vibe.SEL_FACTORY, "factory()"),
+                         (vibe.SEL_COMPLETE, "complete()"), (vibe.SEL_POOL_ID, "poolId()")]:
+            self.assertEqual(sel, abi.selector(sig))
+
+    def test_launch_and_the_creators_first_buy(self):
+        launch = vibe.decode_launch(VIBE["launch"]["log"], VIBE["factory"])
+        self.assertEqual((launch.token, launch.curve), (VIBE["curve"]["token"], VIBE["curve"]["address"]))
+        self.assertEqual((launch.quote, launch.bps, launch.target), (abi.ZERO_ADDRESS, 200, 4 * ETH))
+        self.assertIsNone(vibe.decode_launch(VIBE["launch"]["log"], "0x" + "11" * 20))  # not the factory
+        tx = VIBE["launch"]["tx"]
+        firsts = [b for b in map(vibe.decode_first_buy, tx["logs"]) if b]
+        self.assertEqual(len(firsts), 1)
+        b = firsts[0]
+        self.assertTrue(b.first)
+        self.assertEqual(b.recipient, launch.launcher)
+        self.assertEqual(b.recipient, tx["from"])
+        self.assertEqual(b.tokens, launch.first_buy)
+        moved = _transfers(tx["logs"], launch.token)
+        self.assertIn((launch.curve, launch.launcher, b.tokens), moved)
+        self.assertIn((launch.curve, launch.token, b.tax_tokens), moved)  # the tax, to the token contract
+        # the transaction's value: the buy, its fee and a 0.0004 ETH launch fee
+        self.assertEqual(int(tx["value"], 16), b.quote_paid + 4 * 10 ** 14)
+
+    def test_router_buy_and_sell_in_a_token_quoted_curve(self):
+        launch = vibe.decode_launch(VIBE["quoted_launch"]["log"], VIBE["factory"])
+        self.assertNotEqual(launch.quote, abi.ZERO_ADDRESS)
+        buy_tx, sell_tx = VIBE["quoted_buy"], VIBE["quoted_sell"]
+        b = next(x for x in map(vibe.decode_buy, buy_tx["logs"]) if x)
+        self.assertEqual((b.curve, b.caller, b.recipient), (launch.curve, VIBE["router"], buy_tx["from"]))
+        moved = _transfers(buy_tx["logs"], launch.token)
+        self.assertIn((launch.curve, b.recipient, b.tokens), moved)
+        self.assertIn((launch.curve, launch.token, b.tax_tokens), moved)
+        paid = [v for _, to, v in _transfers(buy_tx["logs"], launch.quote) if to == launch.curve]
+        self.assertEqual(len(paid), 1)
+        self.assertLessEqual(abs(paid[0] - b.quote_paid), 1)  # quote net + fee, to the wei
+        s = next(x for x in map(vibe.decode_sell, sell_tx["logs"]) if x)
+        self.assertEqual((s.seller, s.recipient), (sell_tx["from"], VIBE["router"]))
+        moved = _transfers(sell_tx["logs"], launch.token)
+        self.assertIn((s.seller, launch.curve, s.tokens), moved)
+        self.assertIn((launch.curve, launch.token, s.tax_tokens), moved)
+        self.assertIn((launch.curve, s.recipient, s.quote_received), _transfers(sell_tx["logs"], launch.quote))
+        # nothing else decodes as a trade
+        self.assertEqual(sum(vibe.decode_trade(lg) is not None for lg in buy_tx["logs"] + sell_tx["logs"]), 2)
+
+    def test_the_charge_is_split_between_tax_and_fee(self):
+        buys = [b for b in map(vibe.decode_buy, VIBE["curve"]["logs"]) if b]
+        self.assertGreater(len(buys), 10)
+        for b in buys:
+            self.assertAlmostEqual(b.tax_tokens / b.tokens_gross + b.fee / b.quote_net, b.bps / 10_000, places=6)
+
+    def test_a_whole_curve_replays_to_its_target(self):
+        """Buys move net quote in and gross tokens out, sells gross quote out and net tokens in;
+        over the curve's life that ends at exactly the target with nothing left. At every
+        trade the event-only model gives the reserves' own price and progress (the quote
+        raised of the target: vibe/vibe's site shows that for V6 curves)."""
+        target, supply = 4 * ETH, 8 * 10 ** 26
+        k, phantom = vibe.curve_k(target, supply), vibe.virtual_quote(target)
+        real, left = 0, supply
+        kinds = set()
+        for lg in VIBE["curve"]["logs"]:
+            tr = vibe.decode_trade(lg)
+            if tr is None:
+                continue
+            if isinstance(tr, vibe.Buy):
+                real, left = real + tr.quote_net, left - tr.tokens_gross
+                kinds.add("first" if tr.first else "buy")
+            else:
+                real, left = real - tr.quote_gross, left + tr.tokens_net
+                kinds.add("sell")
+            price, progress = vibe.after_trade(tr, k, phantom, target, 18, 18)
+            self.assertAlmostEqual(price / ((real + phantom) / (left + supply // 3)), 1, places=6)
+            self.assertAlmostEqual(progress, real / target, places=6)  # V6: the quote raised, as the site
+        self.assertEqual(kinds, {"first", "buy", "sell"})
+        self.assertEqual((real, left), (target, 0))
+        g = next(x for x in map(vibe.decode_graduated, VIBE["curve"]["logs"]) if x)
+        self.assertEqual((g.quote_to_pool, g.tokens_to_pool), (target, 2 * 10 ** 26))
+
+    def test_the_curve_percent_is_vibe_vibes(self):
+        """vibe/vibe's site shows the tokens sold of a curve-factory curve (its API's
+        progressBps: VORRA 92.0% with 75.1% of the ETH raised) but the quote raised of a V6
+        curve ($SHBUYS: 43.9% on the site, 75.8% of its tokens sold). The helpers give the
+        tokens' share for either shape: on V6, 87.8% of the quote is 96.6% of the tokens."""
+        target = 4 * ETH
+        k, phantom = vibe.curve_k(target, vibe.V6_CURVE_SUPPLY), vibe.virtual_quote(target)
+        self.assertEqual(vibe.curve_supply(k, phantom), vibe.V6_CURVE_SUPPLY)
+        self.assertAlmostEqual(vibe.sold_share(k, phantom, phantom + 0.878 * target), 4 / 3 - 4 / (9 * 0.878 + 3))
+        self.assertAlmostEqual(vibe.sold_share(k, phantom, phantom + target), 1.0)
+        self.assertEqual(vibe.sold_share(k, phantom, phantom), 0.0)
+        self.assertIsNone(vibe.curve_supply(k, phantom * 10))  # a shape we do not know
+
+    def test_graduation_opens_the_pool_it_names(self):
+        token, curve = VIBE["curve"]["token"], VIBE["curve"]["address"]
+        logs = VIBE["graduation"]["logs"]
+        g = next(x for x in map(vibe.decode_graduated, logs) if x)
+        self.assertEqual(g.curve, curve)
+        self.assertEqual(vibe.pool_id(token, abi.ZERO_ADDRESS, VIBE["hook"]), g.pool_id)
+        self.assertEqual(VIBE["graduated_views"]["pool_id"], g.pool_id)
+        init = next(lg for lg in logs if lg["topics"][0] == pools.TOPIC_V4_INITIALIZE)
+        self.assertEqual(init["topics"][1], g.pool_id)
+        data = abi.to_bytes(init["data"])
+        self.assertEqual((abi.word_uint(data, 0), abi.word_uint(data, 1), abi.word_address(data, 2)),
+                         (0, 60, VIBE["hook"]))
+        b = next(x for x in map(vibe.decode_buy, logs) if x)  # the buy that filled the curve
+        self.assertEqual(b.recipient, VIBE["graduation"]["from"])
+        self.assertLess(b.log_index, g.log_index)
+
+    def test_views_around_a_live_trade(self):
+        snap = VIBE["snapshot"]
+        before, after = vibe_state(snap["before"]), vibe_state(snap["after"])
+        tr = vibe.decode_trade(snap["trade"])
+        self.assertIsInstance(tr, vibe.Buy)
+        self.assertEqual(after.real_quote - before.real_quote, tr.quote_net)
+        self.assertEqual(before.tokens_left - after.tokens_left, tr.tokens_gross)
+        self.assertEqual(after.k, before.k)
+        price, progress = vibe.after_trade(tr, before.k, before.phantom, before.target, 18, 18)
+        self.assertAlmostEqual(price / after.price(), 1, places=9)
+        self.assertAlmostEqual(progress, after.progress, places=9)
+        self.assertFalse(after.complete)
+        self.assertIsNone(after.pool_id)
+        done = vibe_state(VIBE["graduated_views"])
+        self.assertTrue(done.complete)
+        self.assertEqual(done.pool_id, VIBE["graduated_views"]["pool_id"])
+
+    def test_contracts_per_chain(self):
+        v6, curve = chain.vibe_contracts(chain.TESTNET_CHAIN_ID)
+        self.assertEqual((v6.factory, v6.hook, v6.router, v6.gen), (VIBE["factory"], VIBE["hook"], VIBE["router"], "v6"))
+        self.assertEqual((curve.factory, curve.gen), (VIBE_C["factory"], "curve"))
+        self.assertEqual(chain.vibe_contracts(chain.CHAIN_ID), ())  # not on mainnet yet
+        self.assertEqual(chain.vibe_contracts(None), ())
+        self.assertIs(chain.vibe_factory(VIBE_C["factory"].upper().replace("0X", "0x")), curve)
+        self.assertIsNone(chain.vibe_factory("0x" + "11" * 20))
+        self.assertEqual(chain.network(chain.TESTNET_CHAIN_ID), "Robinhood Chain testnet")
+        self.assertIn(VIBE["router"], pools.ROUTERS)
+
+    def test_a_taxed_tokens_own_contract_is_never_the_buyer(self):
+        # the pool hook sends the tax to the token contract before the buyer's share
+        tx = VIBE["quoted_buy"]
+        quote = vibe.decode_launch(VIBE["quoted_launch"]["log"], VIBE["factory"]).quote
+        moved = _transfers(tx["logs"], quote)
+        self.assertEqual(moved[0][:2], (chain.POOL_MANAGER, quote))
+        named = pools.payouts(tx["logs"], {chain.POOL_MANAGER}).get((quote, tx["tx"]))
+        self.assertNotEqual(named, quote)
+        self.assertIsNotNone(named)
+
+    def test_state_is_read_only_from_the_factorys_curves(self):
+        snap = VIBE["snapshot"]
+        names = {vibe.SEL_TOKEN: "token", vibe.SEL_FACTORY: "factory", vibe.SEL_QUOTE: "quote",
+                 vibe.SEL_TARGET: "target", vibe.SEL_REAL_QUOTE: "real_quote",
+                 vibe.SEL_TOKENS_LEFT: "tokens_left", vibe.SEL_TOKENS_SOLD: "tokens_sold",
+                 vibe.SEL_COMPLETE: "complete", vibe.SEL_POOL_ID: "pool_id"}
+
+        class Rpc:
+            async def eth_call(self, to, data, block="latest"):
+                return snap["after"][names[data]]
+
+        self.assertEqual(run(vibe.state(Rpc(), snap["curve"], VIBE["factory"])), vibe_state(snap["after"]))
+        self.assertIsNone(run(vibe.state(Rpc(), snap["curve"], "0x" + "11" * 20)))
+
+
+class VibeRpc:
+    """A testnet RPC that knows one graduated vibe/vibe launch (from the fixture)."""
+
+    def __init__(self, chain_id=chain.TESTNET_CHAIN_ID, launch_log=None, curve_views=None):
+        self.launch = launch_log or VIBE["launch"]["log"]
+        self.views = curve_views or VIBE["graduated_views"]
+        self.token, self.curve = VIBE["curve"]["token"], VIBE["curve"]["address"]
+        self._chain_id = chain_id
+        self.block = int(self.launch["blockNumber"], 16)
+        self.created = int(self.views["created_at"], 16)
+        self.head = self.block + 50_000
+
+    async def chain_id(self):
+        return self._chain_id
+
+    async def block_number(self):
+        return self.head
+
+    async def block_time(self, block):
+        return self.created + (block - self.block) // 7  # about 7 blocks a second
+
+    async def get_logs(self, frm, to, address=None, topics=None):
+        lg = self.launch
+        if (address == lg["address"] and frm <= self.block <= to and topics[0] == lg["topics"][0]
+                and topics[3] == lg["topics"][3]):
+            return [lg]
+        return []
+
+    async def eth_call(self, to, data, block="latest"):
+        word = {
+            (self.token, "0x7165485d"): abi.address_topic(self.curve),
+            (self.token, chain.SEL_DECIMALS): "0x" + abi.encode_uint(18),
+            (self.token, chain.SEL_TOTAL_SUPPLY): "0x" + abi.encode_uint(10 ** 27),
+        }.get((to, data))
+        if word:
+            return word
+        if to == self.token and data in (chain.SEL_NAME, chain.SEL_SYMBOL):
+            return "0x" + abi.encode_uint(32) + abi.encode_uint(2) + b"UG".hex().ljust(64, "0")
+        if to == self.curve:
+            by_sel = {vibe.SEL_TOKEN: "token", vibe.SEL_FACTORY: "factory", vibe.SEL_QUOTE: "quote",
+                      vibe.SEL_TARGET: "target", vibe.SEL_REAL_QUOTE: "real_quote",
+                      vibe.SEL_TOKENS_LEFT: "tokens_left", vibe.SEL_TOKENS_SOLD: "tokens_sold",
+                      vibe.SEL_COMPLETE: "complete", vibe.SEL_POOL_ID: "pool_id", "0xcf09e0d0": "created_at"}
+            if data in by_sel:
+                return self.views[by_sel[data]]
+        return "0x"  # no contract there (the Pons factory and Flap's Portal on testnet)
+
+
+class VibeTracking(unittest.TestCase):
+    def test_a_vibe_launch_is_recognised_by_the_factorys_log(self):
+        from buybot import tokens
+        t, found = run(tokens.load_token(VibeRpc(), VIBE["curve"]["token"]))
+        launch = vibe.decode_launch(VIBE["launch"]["log"], VIBE["factory"])
+        self.assertEqual(found, [])
+        self.assertEqual((t.kind, t.curve, t.deployer, t.pair), ("vibe", launch.curve, launch.launcher, chain.NATIVE))
+        self.assertEqual((t.threshold, t.quote_symbol, t.quote_kind), (4 * ETH, "ETH", "eth"))
+        self.assertTrue(t.graduated)
+        self.assertEqual(t.pool_id, VIBE["graduated_views"]["pool_id"])
+
+    def test_a_curve_on_the_curve_keeps_its_constants(self):
+        from buybot import tokens
+        live = dict(VIBE["snapshot"]["after"], token=VIBE["graduated_views"]["token"],
+                    created_at=VIBE["graduated_views"]["created_at"])
+        t, _ = run(tokens.load_token(VibeRpc(curve_views=live), VIBE["curve"]["token"]))
+        st = vibe_state(live)
+        self.assertFalse(t.graduated)
+        self.assertEqual((t.curve_k, t.phantom), (st.k, st.phantom))
+        self.assertEqual(t.pool_id, vibe.pool_id(t.address, chain.NATIVE, VIBE["hook"]))
+
+    def test_a_vibe_token_as_quote_is_valued_by_its_curve(self):
+        live = dict(VIBE["snapshot"]["after"], token=VIBE["graduated_views"]["token"])
+        rpc = VibeRpc(curve_views=live)
+        kind = f"vibe:{VIBE['curve']['address']}:{'0x' + '00' * 32}"
+        rate = run(quotes.Rates(rpc, FakeEthUsd()).get(kind))
+        self.assertAlmostEqual(rate, vibe_state(live).price() * 3000)
+        self.assertIsNone(run(quotes.Rates(rpc, FakeEthUsd()).get("vibe:" + "0x" + "11" * 20 + ":0x00")))
+
+    def test_only_the_factorys_own_log_counts(self):
+        from buybot import tokens
+        fake = dict(VIBE["launch"]["log"], address="0x" + "11" * 20)
+        with self.assertRaises(tokens.TokenError):
+            run(tokens.load_token(VibeRpc(launch_log=fake), VIBE["curve"]["token"]))
+        with self.assertRaises(tokens.TokenError):  # no vibe/vibe on mainnet yet
+            run(tokens.load_token(VibeRpc(chain_id=chain.CHAIN_ID), VIBE["curve"]["token"]))
+
+    def test_a_revert_means_not_vibe_but_a_failing_rpc_is_raised(self):
+        from buybot import tokens
+
+        class Reverts(VibeRpc):
+            async def eth_call(self, to, data, block="latest"):
+                if data == "0x7165485d":
+                    raise Exception("RPC error 3: execution reverted")
+                return await super().eth_call(to, data, block)
+
+        class Down(VibeRpc):
+            async def get_logs(self, frm, to, address=None, topics=None):
+                raise Exception("getLogs failed after 6 tries (HTTP 503)")
+
+        contracts = chain.vibe_contracts(chain.TESTNET_CHAIN_ID)[0]
+        self.assertIsNone(run(tokens.find_vibe_launch(Reverts(), VIBE["curve"]["token"], contracts)))
+        with self.assertRaises(Exception) as caught:
+            run(tokens.load_token(Down(), VIBE["curve"]["token"]))
+        self.assertNotIsInstance(caught.exception, tokens.TokenError)  # "chain down", not "not a token"
+
+
+class VibeFakeRpc(FakeRpc):
+    async def chain_id(self):
+        return chain.TESTNET_CHAIN_ID
+
+
+def vibe_token(**over) -> Token:
+    launch = vibe.decode_launch(VIBE["launch"]["log"], VIBE["factory"])
+    t = Token(address=launch.token, curve=launch.curve, deployer=launch.launcher, pair=chain.NATIVE,
+              quote_symbol="ETH", quote_decimals=18, quote_kind="eth", name="Vibe Token", symbol="UG",
+              decimals=18, total_supply=10 ** 27, threshold=launch.target,
+              pool_id=vibe.pool_id(launch.token, chain.NATIVE, VIBE["hook"]),
+              curve_k=vibe.curve_k(launch.target, 8 * 10 ** 26), phantom=vibe.virtual_quote(launch.target),
+              graduated=False, added_at=0, kind="vibe")
+    for k, v in over.items():
+        setattr(t, k, v)
+    return t
+
+
+# vibe/vibe's test AAPL and its pool against ETH, as on testnet on 2026-10-19 (the swap
+# in 0xfb26c737…: 0.0409 ETH in through the router): 1 AAPL = 1.3116 ETH
+TEST_AAPL = "0x438820dcfe62a21e306614a4b54383cd8a36acf2"
+AAPL_SQRT_PRICE, AAPL_LIQUIDITY = 69180935715363039438302251340, 7071067811865475244
+
+
+class EthPoolRpc(VibeFakeRpc):
+    """Answers the PoolManager's extsload for one pool: its sqrtPriceX96 and liquidity."""
+    pool_liquidity = AAPL_LIQUIDITY
+
+    async def eth_call(self, to, data, block="latest"):
+        if to == chain.POOL_MANAGER and data.startswith(pools.SEL_EXTSLOAD):
+            slot = int(data[len(pools.SEL_EXTSLOAD):], 16)
+            base = pools.v4_state_slot(pools.eth_pool_id(TEST_AAPL))
+            if slot == base:
+                return "0x" + abi.encode_uint(AAPL_SQRT_PRICE)
+            if slot == base + pools.V4_LIQUIDITY_OFFSET:
+                return "0x" + abi.encode_uint(self.pool_liquidity)
+            return "0x" + abi.encode_uint(0)
+        return await super().eth_call(to, data, block)
+
+
+class EthPoolQuotes(unittest.TestCase):
+    """A testnet stock token has no feed: its v4 pool against ETH values it, the pool
+    vibe/vibe's router swaps through and the vibe/vibe site prices it by."""
+
+    def test_the_pool_id_is_the_routers(self):
+        self.assertEqual(pools.eth_pool_id(TEST_AAPL),
+                         "0x60e44167df8938068cdb05cbeb03b66223261778112681a0484bcf337aea870a")
+
+    def test_share_on_x(self):
+        """Buys, levels and graduations get an X Share button in a row of its own, with
+        the post's line and the token's page; sells get none."""
+        from urllib.parse import parse_qs, urlparse
+        from buybot.sender import keyboard
+        buy = {"symbol": "SHBUYS", "token": "0x" + "7c" * 20, "tx": "0x" + "ab" * 32, "usd": 327.0,
+               "usd_approx": True, "quote": 0.0324, "quote_symbol": "AAPL", "mc_usd": 57917.0}
+        self.assertEqual(render.share_text(buy, "buy"), "🟢 $SHBUYS buy: ≈$327 · MC ≈$57,917")
+        self.assertIsNone(render.share_text(buy, "sell"))
+        self.assertEqual(render.share_text({"symbol": "SHBUYS", "what": "mc", "level": 25000.0}, "milestone"),
+                         "🚀 $SHBUYS hit $25K market cap")
+        self.assertEqual(render.share_text({"symbol": "SHBUYS", "dex": "Uniswap v4"}, "grad"),
+                         "🎓 $SHBUYS graduated to Uniswap v4")
+        pairs = render.buttons(buy, "https://testnet.vibevibe.fun/token/{token}", "https://ex",
+                               render.share_text(buy, "buy"))
+        rows = keyboard(pairs).inline_keyboard
+        self.assertEqual([len(r) for r in rows], [4, 1])
+        text = parse_qs(urlparse(rows[1][0].url).query)["text"][0]
+        self.assertIn("🟢 $SHBUYS buy", text)
+        self.assertIn("https://testnet.vibevibe.fun/token/" + buy["token"], text)
+        self.assertEqual(len(keyboard(render.buttons(buy, "", "")).inline_keyboard), 1)
+
+    def test_pool_dollars_are_shown_as_approximate(self):
+        p = {"symbol": "SHBUYS", "quote_symbol": "AAPL", "quote": 0.03128, "usd": 99.12, "usd_approx": True,
+             "tokens": 17e6, "mc_usd": 9190.0, "token": "0x" + "7c" * 20}
+        text = render.buy_text(p, chat())
+        self.assertIn("≈$99.12", text)
+        self.assertIn("MC <b>≈$9,190", text)
+        self.assertNotIn("≈", render.buy_text(dict(p, usd_approx=False), chat()))
+
+    def test_a_deep_pool_gives_dollars_and_a_thin_one_none(self):
+        from buybot import tokens
+        kind = run(tokens.eth_pool_kind(EthPoolRpc(0, []), TEST_AAPL))
+        self.assertEqual(kind, f"ethpool:{TEST_AAPL}:{pools.eth_pool_id(TEST_AAPL)}")
+        usd = run(quotes.Rates(EthPoolRpc(0, []), FakeEthUsd()).get(kind))
+        self.assertAlmostEqual(usd / 3000, 1.31155, places=4)
+
+        class Thin(EthPoolRpc):
+            pool_liquidity = 10 ** 15
+        self.assertIsNone(run(tokens.eth_pool_kind(Thin(0, []), TEST_AAPL)))
+        self.assertIsNone(run(quotes.Rates(Thin(0, []), FakeEthUsd()).get(kind)))
+
+
+class VibeWatcher(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.db = Db(os.path.join(self.dir.name, "t.db"))
+        self.token = vibe_token()
+        self.db.upsert_token(self.token)
+        self.db.ensure_chat(-1)
+        self.db.update_chat(-1, token=self.token.address, sells=1, min_usd=0)  # every trade, however small
+
+    def tearDown(self):
+        self.db.close()
+        self.dir.cleanup()
+
+    def tick(self, logs: list[dict], balance: float | None = None):
+        """One tick over the logs; `balance` is every wallet's token balance, in whole tokens."""
+        blocks = [int(lg["blockNumber"], 16) for lg in logs]
+        self.db.set_last_block(min(blocks) - 1)
+
+        class Rpc(VibeFakeRpc):
+            async def eth_call(self, to, data, block="latest"):
+                if balance is not None and data.startswith(chain.SEL_BALANCE_OF):
+                    return "0x" + abi.encode_uint(int(balance * 10 ** 18))
+                return await super().eth_call(to, data, block)
+
+        w = Watcher(Rpc(max(blocks), logs), self.db, FakeEthUsd(), max_range=10 ** 7, max_catchup=10 ** 7)
+        w._phase_checked = time.time()
+        run(w.tick())
+        return [r for r in self.db.pending_outbox() if r.kind in ("buy", "sell", "grad")]
+
+    def test_a_whole_curve_life_is_posted(self):
+        logs = VIBE["curve"]["logs"]
+        rows = self.tick(logs)
+        trades = [vibe.decode_trade(lg) for lg in logs]
+        n_buys = sum(isinstance(tr, vibe.Buy) for tr in trades)
+        n_sells = sum(isinstance(tr, vibe.Sell) for tr in trades)
+        kinds = [r.kind for r in rows]
+        self.assertEqual((kinds.count("buy"), kinds.count("sell"), kinds.count("grad")), (n_buys, n_sells, 1))
+        self.assertEqual(kinds[-1], "grad")
+        buys = [r.payload for r in rows if r.kind == "buy"]
+        first = buys[0]
+        self.assertTrue(first["dev"] and first["first_buy"])
+        self.assertEqual(first["buyer"], self.token.deployer)
+        for p, tr in zip(buys, [tr for tr in trades if isinstance(tr, vibe.Buy)]):
+            self.assertEqual(p["buyer"], tr.recipient)
+            self.assertNotEqual(p["buyer"], VIBE["router"])
+            self.assertAlmostEqual(p["tokens"], tr.tokens / 1e18)       # what the buyer received
+            self.assertAlmostEqual(p["tax_tokens"], tr.tax_tokens / 1e18)
+            self.assertAlmostEqual(p["quote"], tr.quote_paid / 1e18)   # what the buyer paid
+            self.assertEqual((p["venue"], p["launchpad"], p["network"]),
+                             ("curve", "vibe/vibe", "Robinhood Chain testnet"))
+        self.assertAlmostEqual(buys[-1]["progress"], 1.0, places=6)
+        sell = next(r.payload for r in rows if r.kind == "sell")
+        st = next(tr for tr in trades if isinstance(tr, vibe.Sell))
+        self.assertEqual(sell["buyer"], st.seller)
+        self.assertAlmostEqual(sell["quote"], st.quote_received / 1e18)
+        self.assertIn("UG", render.buy_text(buys[1], chat()))
+        grad = rows[-1].payload
+        self.assertEqual((grad["raised"], grad["dex"], grad["launchpad"]), (4.0, "Uniswap v4", "vibe/vibe"))
+        # the graduation card: the pool's opening market cap (4 ETH for 200M tokens: 20 ETH), done curve
+        self.assertAlmostEqual(grad["mc_quote"], 20.0)
+        self.assertEqual((grad["venue"], grad["progress"], grad["quote"]), ("v4", 1.0, 4.0))
+        self.assertAlmostEqual(grad["mc_usd"], 20.0 * 3000)
+        self.assertIn("Uniswap v4", render.graduation_text(grad))
+        self.assertTrue(self.db.get_token(self.token.address).graduated)
+        self.assertEqual(len(self.db.trades_since(self.token.address, 0)), n_buys + n_sells)
+
+    def test_two_quick_buys_of_one_wallet_make_one_new_holder(self):
+        """Seen on testnet ($TRAV): a wallet bought twice within seconds and both posts said
+        "new holder". The balance is read once a tick, so each buy takes back the wallet's
+        later trades in it; and a wallet seen buying before is never new again."""
+        buy = next(lg for lg in VIBE["curve"]["logs"] if lg["topics"][0] == vibe.TOPIC_CURVE_BUY)
+        got = vibe.decode_buy(buy).tokens / 1e18
+
+        def buy_of(wallet, block, index):
+            return dict(buy, topics=[*buy["topics"][:2], abi.address_topic(wallet)], blockNumber=hex(block),
+                        logIndex=hex(index), transactionHash="0x" + format(block * 100 + index, "064x"))
+
+        def holders(rows, wallet):
+            return [r.payload.get("holder") for r in rows if r.kind == "buy" and r.payload["buyer"] == wallet]
+
+        same = "0x" + "e6" * 20  # both buys in one block: the balance holds both
+        first, second = holders(self.tick([buy_of(same, 1000, 1), buy_of(same, 1000, 2)], balance=2 * got), same)
+        self.assertTrue(first["new"])
+        self.assertNotIn("new", second)
+        self.assertAlmostEqual(second["change"], 1.0)  # held one buy, bought another: +100%
+
+        apart = "0x" + "e7" * 20  # adjacent blocks, two ticks, sold out in between
+        self.assertTrue(holders(self.tick([buy_of(apart, 2000, 1)], balance=got), apart)[0]["new"])
+        again = holders(self.tick([buy_of(apart, 2001, 1)], balance=got), apart)
+        self.assertEqual(len(again), 2)
+        self.assertNotIn("new", again[1])
+        self.assertAlmostEqual(again[1]["share"], got / 1e9)
+        self.assertNotIn("New holder", render.buy_text(dict(self.db.pending_outbox()[-1].payload), chat()))
+
+    def test_dust_in_a_quote_without_a_price_is_skipped(self):
+        """Seen on testnet ($TRAV, quoted in a test AAPL that has no price): a 0.0004 AAPL
+        buy was posted. A new chat's minimum also skips such dust, measured against the
+        curve's target; /minbuy 0 posts it again."""
+        from buybot.db import DEFAULT_MIN_USD
+        self.db.ensure_chat(-2)
+        self.assertEqual(self.db.get_chat(-2).min_usd, DEFAULT_MIN_USD)
+        self.db.update_chat(-1, min_usd=DEFAULT_MIN_USD)
+        with self.db.conn:  # the same curve, quoted in a stock token without a price: target 4 AAPL
+            self.db.conn.execute("UPDATE tokens SET quote_symbol='AAPL', quote_kind='other'")
+        buys = [lg for lg in VIBE["curve"]["logs"] if lg["topics"][0] == vibe.TOPIC_CURVE_BUY]
+        quotes_paid = [vibe.decode_buy(lg).quote_paid / 1e18 for lg in buys]
+        tiny = [q for q in quotes_paid if q < 4 * 1e-4]
+        self.assertTrue(tiny and len(tiny) < len(quotes_paid))  # the fixture has both kinds
+        posted = [r.payload for r in self.tick(buys) if r.kind == "buy"]
+        self.assertTrue(all(p["usd"] is None for p in posted))
+        self.assertEqual(len(posted), len(quotes_paid) - len(tiny))
+        self.assertGreaterEqual(min(p["quote"] for p in posted), 4 * 1e-4)
+
+        self.db.update_chat(-1, min_usd=0)
+        self.db.clear_chat_outbox(-1)
+        self.assertEqual(len([r for r in self.tick(buys) if r.kind == "buy"]), len(buys))
+
+    def test_a_curve_in_test_aapl_gets_approximate_dollars(self):
+        """$SHBUYS and $TRAV trade against vibe/vibe's test AAPL: the dollars come from the
+        AAPL/ETH pool (marked approximate), and the phase check gives a token tracked
+        before this its pool once."""
+        with self.db.conn:
+            self.db.conn.execute("UPDATE tokens SET quote_symbol='AAPL', quote_kind='other', pair=?",
+                                 (TEST_AAPL,))
+        w = Watcher(EthPoolRpc(0, []), self.db, FakeEthUsd())
+        run(w.refresh_phases(self.db.tracked_tokens()))
+        self.assertTrue(self.db.get_token(self.token.address).quote_kind.startswith("ethpool:"))
+
+        buys = [lg for lg in VIBE["curve"]["logs"] if lg["topics"][0] == vibe.TOPIC_CURVE_BUY][:3]
+        blocks = [int(lg["blockNumber"], 16) for lg in buys]
+        self.db.set_last_block(min(blocks) - 1)
+        w = Watcher(EthPoolRpc(max(blocks), buys), self.db, FakeEthUsd(), max_range=10 ** 7, max_catchup=10 ** 7)
+        w._phase_checked = time.time()
+        run(w.tick())
+        posted = [r.payload for r in self.db.pending_outbox() if r.kind == "buy"]
+        self.assertEqual(len(posted), 3)
+        for p in posted:
+            self.assertTrue(p["usd_approx"])
+            self.assertAlmostEqual(p["usd"], p["quote"] * 1.31155 * 3000, delta=p["usd"] * 1e-4)
+            self.assertIsNotNone(p["mc_usd"])
+
+    def test_pool_buys_show_what_the_buyer_got_after_the_hooks_tax(self):
+        self.db.upsert_token(vibe_token(graduated=True))
+        gross, tax, block = 10 ** 24, 128 * 10 ** 20, 1000
+        wallet, tx = "0x" + "77" * 20, "0x" + "cd" * 32
+        swap = v4_swap_log(self.token.pool_id, -ETH, gross, 1000 * 2 ** 96, block=block)
+
+        def transfer(frm, to, value, index):
+            return {"address": self.token.address, "transactionHash": tx, "blockNumber": hex(block),
+                    "logIndex": hex(index), "data": "0x" + abi.encode_uint(value),
+                    "topics": [chain.TOPIC_TRANSFER, abi.address_topic(frm), abi.address_topic(to)]}
+
+        logs = [swap, transfer(chain.POOL_MANAGER, self.token.address, tax, 2),
+                transfer(chain.POOL_MANAGER, VIBE["router"], gross - tax, 3),
+                transfer(VIBE["router"], wallet, gross - tax, 4)]
+        rows = self.tick(logs)
+        self.assertEqual([r.kind for r in rows], ["buy"])
+        p = rows[0].payload
+        self.assertEqual((p["venue"], p["dex"], p["buyer"]), ("v4", "Uniswap v4", wallet))
+        self.assertAlmostEqual(p["tokens"], (gross - tax) / 1e18)
+        self.assertAlmostEqual(p["tax_tokens"], tax / 1e18)
+
+    def test_pool_sells_show_what_the_seller_gave(self):
+        # testnet: the seller sends n tokens to the PoolManager, the hook sends the token
+        # contract the tax, and the Swap reports n - tax
+        self.db.upsert_token(vibe_token(graduated=True))
+        sent, tax, block, tx = 10 ** 24, 128 * 10 ** 20, 1000, "0x" + "cd" * 32
+        swap = v4_swap_log(self.token.pool_id, ETH // 10, -(sent - tax), 1000 * 2 ** 96, block=block)
+        tax_log = {"address": self.token.address, "transactionHash": tx, "blockNumber": hex(block),
+                   "logIndex": "0x2", "data": "0x" + abi.encode_uint(tax),
+                   "topics": [chain.TOPIC_TRANSFER, abi.address_topic(chain.POOL_MANAGER),
+                              abi.address_topic(self.token.address)]}
+        rows = self.tick([swap, tax_log])
+        self.assertEqual([r.kind for r in rows], ["sell"])
+        self.assertAlmostEqual(rows[0].payload["tokens"], sent / 1e18)
+        self.assertAlmostEqual(rows[0].payload["tax_tokens"], tax / 1e18)
+
+    def test_backfill_loads_the_curves_history(self):
+        logs = VIBE["curve"]["logs"]
+        head = max(int(lg["blockNumber"], 16) for lg in logs)
+        w = Watcher(VibeFakeRpc(head, logs), self.db, FakeEthUsd())
+        n = sum(isinstance(vibe.decode_trade(lg), (vibe.Buy, vibe.Sell)) for lg in logs)
+        self.assertEqual(run(w.backfill(self.token, hours=24 * 30)), n)
+        self.assertEqual(len(self.db.trades_since(self.token.address, 0)), n)
+
+    def test_backfill_reads_the_hours_at_the_chains_real_pace(self):
+        """Testnet's pace drifts (6.7 blocks a second in October, 8.85 two days later): the
+        block times decide where a day of history starts, not the constant."""
+        class Slow(VibeFakeRpc):
+            async def block_time(self, block):
+                return 1_700_000_000 + block // 4      # 4 blocks a second
+
+        head = 10_000_000
+        rpc = Slow(head, [])
+        run(Watcher(rpc, self.db, FakeEthUsd()).backfill(self.token, hours=1))
+        start = min(frm for frm, *_ in rpc.get_logs_calls)
+        self.assertAlmostEqual(head - start, 3600 * 4, delta=10)
+
+    def test_phase_refresh_catches_a_missed_graduation(self):
+        w = Watcher(VibeRpc(), self.db, FakeEthUsd())
+        run(w.refresh_phases(self.db.tracked_tokens()))
+        self.assertTrue(self.db.get_token(self.token.address).graduated)
+
+
 class Texts(unittest.TestCase):
     def test_nothing_is_sold_or_advertised(self):
         """No text offers Pro, ads, Stars or 'free with ads' any more."""
@@ -1646,6 +2322,28 @@ class TokenDay(unittest.TestCase):
 
 
 class Config(unittest.TestCase):
+    def test_network_defaults_and_miniapp_configuration(self):
+        from unittest.mock import patch
+        from buybot.config import load_config
+        with patch.dict(os.environ, {"BOT_TOKEN": "test", "RPC_URL":
+                                    "https://rpc.testnet.chain.robinhood.com"}, clear=True):
+            cfg = load_config("missing-test.env")
+            self.assertEqual(cfg.chain_id, 46630)
+            self.assertIn("testnet", cfg.explorer_url)
+            self.assertIn("testnet", cfg.trade_url)
+            os.environ["CHAIN_ID"] = "123"
+            with self.assertRaises(SystemExit):
+                load_config("missing-test.env")
+            os.environ["CHAIN_ID"] = "46630"
+            os.environ["WEBAPP_URL"] = "https://buys.example.com"
+            with self.assertRaises(SystemExit):
+                load_config("missing-test.env")
+            os.environ["WEBAPP_PORT"] = "8095"
+            self.assertEqual(load_config("missing-test.env").webapp_port, 8095)
+            os.environ["WEBAPP_URL"] = "https://buys.example.com/nested"
+            with self.assertRaises(SystemExit):
+                load_config("missing-test.env")
+
     def test_dotenv(self):
         with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as f:
             f.write("# comment\nBUYBOT_TEST_X='quoted'\nBUYBOT_TEST_Y=2\n")
@@ -1657,6 +2355,437 @@ class Config(unittest.TestCase):
             self.assertEqual(os.environ["BUYBOT_TEST_Y"], "kept")
         finally:
             os.unlink(f.name)
+
+
+C_VQ0 = 1_764_594_628_672_298_575       # INITIAL_VIRTUAL_ETH_RESERVE of a 5 ETH curve
+C_VT0 = 1_073_000_000 * 10 ** 18        # virtual tokens at start: 793.1M on the curve + 279.9M
+C_HOOK = chain.vibe_contracts(chain.TESTNET_CHAIN_ID)[1].hook
+
+
+def c_views(**over) -> dict:
+    v = dict(VIBE_C["live"]["views"])
+    v.update({k: "0x" + abi.encode_uint(n) for k, n in over.items()})
+    return v
+
+
+def c_token(**over) -> Token:
+    launch = vibe.decode_launch(VIBE_C["launch"], VIBE_C["factory"])
+    t = Token(address=launch.token, curve=launch.curve, deployer=launch.launcher, pair=chain.NATIVE,
+              quote_symbol="ETH", quote_decimals=18, quote_kind="eth", name="Curve Token", symbol="CRV",
+              decimals=18, total_supply=10 ** 27, threshold=5 * ETH,
+              pool_id=vibe.pool_id(launch.token, chain.NATIVE, C_HOOK), curve_k=C_VQ0 * C_VT0, phantom=C_VQ0,
+              graduated=False, added_at=0, kind="vibe")
+    for k, v in over.items():
+        setattr(t, k, v)
+    return t
+
+
+class CRpc:
+    """A testnet RPC that knows the live curve-factory launch of the fixture."""
+
+    def __init__(self, views=None):
+        live = VIBE_C["live"]
+        self.launch, self.curve, self.views = live["launch"], live["curve"], views or live["views"]
+        self.token = abi.topic_address(self.launch["topics"][2])
+        self.head = int(self.launch["blockNumber"], 16) + 25_000_000  # three windows back
+        self.queries = []
+
+    async def chain_id(self):
+        return chain.TESTNET_CHAIN_ID
+
+    async def block_number(self):
+        return self.head
+
+    async def get_logs(self, frm, to, address=None, topics=None):
+        self.queries.append((frm, to, address))
+        lg = self.launch
+        if (address == lg["address"] and frm <= int(lg["blockNumber"], 16) <= to and topics[0] == lg["topics"][0]
+                and topics[2] == lg["topics"][2]):
+            return [lg]
+        return []
+
+    async def eth_call(self, to, data, block="latest"):
+        if to == self.token:
+            if data == "0x7165485d":
+                return abi.address_topic(self.curve)
+            if data == chain.SEL_DECIMALS:
+                return "0x" + abi.encode_uint(18)
+            if data == chain.SEL_TOTAL_SUPPLY:
+                return "0x" + abi.encode_uint(10 ** 27)
+            if data in (chain.SEL_NAME, chain.SEL_SYMBOL):
+                return "0x" + abi.encode_uint(32) + abi.encode_uint(3) + b"CRV".hex().ljust(64, "0")
+        if to == self.curve:
+            by_sel = {vibe.SEL_TOKEN: "token", vibe.SEL_FACTORY: "factory", vibe.SEL_COMPLETE: "complete",
+                      vibe.SEL_C_GRADUATED: "graduated", vibe.SEL_C_TARGET: "target", vibe.SEL_C_REAL: "real",
+                      vibe.SEL_C_LEFT: "left", vibe.SEL_C_VIRTUAL_QUOTE0: "virtual_quote0",
+                      vibe.SEL_C_VIRTUAL_TOKENS: "virtual_tokens"}
+            if data in by_sel:
+                return self.views[by_sel[data]]
+            raise Exception("RPC error 3: execution reverted")  # a V6 view on this curve
+        return "0x"
+
+
+class VibeCurveFactory(unittest.TestCase):
+    """vibe/vibe's curve factory (the deployment its own config names): its events, its
+    curve math over one whole curve life, and tracking one of its tokens."""
+
+    def test_the_launch_names_token_curve_and_creator(self):
+        live = VIBE_C["live"]["launch"]
+        launch = vibe.decode_launch(live, VIBE_C["factory"])
+        self.assertEqual((launch.token, launch.curve), (abi.topic_address(live["topics"][2]), VIBE_C["live"]["curve"]))
+        self.assertEqual(launch.launcher, abi.word_address(abi.to_bytes(live["data"]), 0))
+        self.assertEqual((launch.quote, launch.target, launch.name), (chain.NATIVE, 0, None))  # from the curve
+        self.assertIsNone(vibe.decode_launch(live, "0x" + "11" * 20))  # anyone can emit the topic
+        self.assertIsNone(vibe.decode_launch(dict(live, address="0x" + "11" * 20), VIBE_C["factory"]))
+
+    def test_buys_and_sells_against_their_fees(self):
+        trades = [vibe.decode_trade(lg) for lg in VIBE_C["first_trades"]]
+        self.assertTrue(all(trades))
+        for tr in trades:
+            if isinstance(tr, vibe.Buy):
+                self.assertEqual((tr.recipient, tr.tax_tokens, tr.first), (tr.caller, 0, False))
+                self.assertEqual(round(tr.fee * 10_000 / tr.quote_paid), vibe.C_FEE_BPS)  # 1.25% of the gross
+            else:
+                self.assertEqual((tr.recipient, tr.tax_tokens, tr.tokens_net), (tr.seller, 0, tr.tokens))
+                self.assertEqual(round(tr.fee * 10_000 / tr.quote_gross), vibe.C_FEE_BPS)
+        first = vibe.decode_trade(VIBE_C["live"]["first_buy"][0])  # the factory calls it at launch
+        self.assertTrue(first.first)
+        self.assertEqual(first.caller, VIBE_C["factory"])
+        self.assertEqual(first.tokens, vibe.decode_launch(VIBE_C["live"]["launch"], VIBE_C["factory"]).first_buy)
+
+    def test_a_whole_curve_life_replays_to_its_target(self):
+        """Every trade of one curve, from launch to graduation, through constant product over
+        the curve's virtual reserves: each fits to a millionth and the curve ends at exactly
+        its 5 ETH target with no tokens left."""
+        st = vibe.State("t", chain.NATIVE, 5 * ETH, 0, vibe.C_CURVE_SUPPLY, 0, False, None,
+                        virtual_quote0=C_VQ0, virtual_tokens=C_VT0 - vibe.C_CURVE_SUPPLY)
+        self.assertEqual(st.k, C_VQ0 * C_VT0)
+        self.assertEqual(C_VQ0, 5 * ETH * 2799 // 7931)  # the target * 279.9M / 793.1M
+        x, y, last = C_VQ0, C_VT0, None
+        for kind, *w in VIBE_C["replay"]:
+            w = [int(v) for v in w]
+            if kind == "b":
+                gross, net, out, cf, pf = w
+                self.assertEqual(gross - net, cf + pf)
+                self.assertAlmostEqual(y - st.k // (x + net), out, delta=out // 10 ** 6)
+                x, y = x + net, y - out
+                tr = vibe.Buy("c", "a", "a", out, out, 0, net, gross - net, 125, False, 1, "0x", 0)
+            else:
+                tokens, gross, net, cf, pf = w
+                self.assertAlmostEqual(x - st.k // (y + tokens), gross, delta=gross // 10 ** 6)
+                x, y = x - gross, y + tokens
+                tr = vibe.Sell("c", "a", "a", tokens, tokens, 0, gross, gross - net, 1, "0x", 0)
+            price, last = vibe.after_trade(tr, st.k, st.phantom, st.target, 18, 18)
+            self.assertIsNotNone(price)
+        self.assertAlmostEqual((x - C_VQ0) / ETH, 5.0, places=12)
+        self.assertLess(abs(y - (C_VT0 - vibe.C_CURVE_SUPPLY)), 10 ** 12)
+        self.assertAlmostEqual(last, 1.0, places=9)
+
+    def test_graduation_names_the_pool_with_this_factorys_hook(self):
+        grad = next(lg for lg in VIBE_C["graduation"] if lg["topics"][0] == vibe.TOPIC_C_GRADUATED)
+        init = next(lg for lg in VIBE_C["graduation"] if lg["topics"][0].startswith("0xdd466e67"))
+        g = vibe.decode_graduated(grad)
+        token = abi.topic_address(init["topics"][3])
+        self.assertEqual(g.pool_id, init["topics"][1])
+        self.assertEqual(g.pool_id, vibe.pool_id(token, chain.NATIVE, C_HOOK))
+        self.assertAlmostEqual(g.quote_to_pool / ETH, 5.0, places=9)
+        self.assertEqual(g.tokens_to_pool, 206_900_000 * ETH)
+
+    def test_state_from_the_curves_own_views(self):
+        st = run(vibe.state(CRpc(), VIBE_C["live"]["curve"]))
+        v = {k: int(x, 16) for k, x in VIBE_C["live"]["views"].items()}
+        self.assertEqual((st.quote, st.target, st.real_quote, st.complete, st.pool_id),
+                         (chain.NATIVE, 5 * ETH, v["real"], False, None))
+        self.assertEqual((st.phantom, st.extra_tokens), (C_VQ0, 279_900_000 * ETH))
+        self.assertAlmostEqual(st.price(), v["virtual_quote"] / v["virtual_tokens"])
+        self.assertAlmostEqual(st.progress, (vibe.C_CURVE_SUPPLY - st.tokens_left) / vibe.C_CURVE_SUPPLY)
+        # the event-only model agrees with the views (curve_supply knows this shape)
+        self.assertEqual(vibe.curve_supply(st.k, st.phantom), vibe.C_CURVE_SUPPLY)
+        self.assertAlmostEqual(vibe.sold_share(st.k, st.phantom, st.phantom + st.real_quote), st.progress, places=6)
+        self.assertIsNone(run(vibe.state(CRpc(c_views(target=7 * ETH)), VIBE_C["live"]["curve"])))  # unknown quote
+        spcx = run(vibe.state(CRpc(c_views(target=82_740_374_439_909_720_323)), VIBE_C["live"]["curve"]))
+        self.assertEqual(spcx.quote, "0x5a5398155d98374c0e26265ea3cb9818169c2739")
+        self.assertTrue(run(vibe.state(CRpc(c_views(graduated=1)), VIBE_C["live"]["curve"])).complete)
+        # full but not graduated yet: no pool to read, so not complete for the bot
+        self.assertFalse(run(vibe.state(CRpc(c_views(complete=1)), VIBE_C["live"]["curve"])).complete)
+
+    def test_track_finds_the_launch_in_ten_million_block_windows(self):
+        from buybot import tokens
+        rpc = CRpc()
+        t, found = run(tokens.load_token(rpc, rpc.token))
+        launch = vibe.decode_launch(rpc.launch, VIBE_C["factory"])
+        self.assertEqual(found, [])
+        self.assertEqual((t.kind, t.curve, t.deployer, t.pair, t.threshold, t.quote_kind),
+                         ("vibe", rpc.curve, launch.launcher, chain.NATIVE, 5 * ETH, "eth"))
+        self.assertEqual((t.curve_k, t.phantom, t.graduated), (C_VQ0 * C_VT0, C_VQ0, False))
+        self.assertEqual(t.pool_id, vibe.pool_id(rpc.token, chain.NATIVE, C_HOOK))
+        searched = [q for q in rpc.queries if q[2] == VIBE_C["factory"]]
+        self.assertEqual(len(searched), 3)
+        self.assertTrue(all(to - frm < tokens.C_LAUNCH_WINDOW for frm, to, _ in searched))
+
+    def test_a_v6_token_is_not_searched_for_in_the_curve_factory(self):
+        from buybot import tokens
+        curve_factory = chain.vibe_contracts(chain.TESTNET_CHAIN_ID)[1]
+        rpc = VibeRpc()
+        self.assertIsNone(run(tokens.find_vibe_launch(rpc, VIBE["curve"]["token"], curve_factory)))
+
+
+class VibeCurveWatcher(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.db = Db(os.path.join(self.dir.name, "t.db"))
+        self.token = c_token()
+        self.db.upsert_token(self.token)
+        self.db.ensure_chat(-1)
+        self.db.update_chat(-1, token=self.token.address, sells=1, min_usd=0)
+
+    def tearDown(self):
+        self.db.close()
+        self.dir.cleanup()
+
+    def test_trades_and_the_graduation_are_posted(self):
+        unique = {(lg["transactionHash"], lg["logIndex"]): lg
+                  for lg in VIBE_C["first_trades"] + VIBE_C["completing"] + VIBE_C["graduation"]}
+        logs = sorted(unique.values(), key=lambda lg: (int(lg["blockNumber"], 16), int(lg["logIndex"], 16)))
+        blocks = [int(lg["blockNumber"], 16) for lg in logs]
+        self.db.set_last_block(min(blocks) - 1)
+        w = Watcher(VibeFakeRpc(max(blocks), logs), self.db, FakeEthUsd(), max_range=10 ** 8, max_catchup=10 ** 8)
+        w._phase_checked = time.time()
+        run(w.tick())
+        rows = [r for r in self.db.pending_outbox() if r.kind in ("buy", "sell", "grad")]
+        trades = [vibe.decode_trade(lg) for lg in logs if lg["topics"][0] in vibe.TRADE_TOPICS]
+        kinds = [r.kind for r in rows]
+        self.assertEqual((kinds.count("buy"), kinds.count("sell"), kinds[-1]),
+                         (sum(isinstance(t, vibe.Buy) for t in trades),
+                          sum(isinstance(t, vibe.Sell) for t in trades), "grad"))
+        buys = [r.payload for r in rows if r.kind == "buy"]
+        for p, tr in zip(buys, [t for t in trades if isinstance(t, vibe.Buy)]):
+            self.assertEqual(p["buyer"], tr.recipient)
+            self.assertAlmostEqual(p["quote"], tr.quote_paid / ETH)
+            self.assertAlmostEqual(p["tokens"], tr.tokens / ETH)
+            self.assertEqual((p["tax_tokens"], p["launchpad"], p["venue"]), (0, "vibe/vibe", "curve"))
+        self.assertAlmostEqual(buys[-1]["progress"], 1.0, places=6)  # the buy that filled the curve
+        sell = next(r.payload for r in rows if r.kind == "sell")
+        st = next(t for t in trades if isinstance(t, vibe.Sell))
+        self.assertEqual(sell["buyer"], st.seller)
+        self.assertAlmostEqual(sell["quote"], st.quote_received / ETH)
+        grad = rows[-1].payload
+        self.assertAlmostEqual(grad["raised"], 5.0, places=9)
+        self.assertEqual(grad["pool_id"], self.token.pool_id)
+        self.assertTrue(self.db.get_token(self.token.address).graduated)
+
+
+# vibe/vibe's read API: a V6 launch, its search item, a curve-factory launch and its candles.
+VIBE_API = json.loads((Path(__file__).parent / "fixtures" / "vibe_api_testnet.json").read_text(encoding="utf-8"))
+
+
+def png(w, h, mode="RGB") -> bytes:
+    import io
+
+    from PIL import Image
+    out = io.BytesIO()
+    Image.new(mode, (w, h), (10, 200, 120)).save(out, "PNG")
+    return out.getvalue()
+
+
+@needs("aiohttp", "PIL")
+class Promo(unittest.TestCase):
+    """/promo: untrusted texts and logos, the API's facts, the spec, cache keys, limits, the queue."""
+
+    def setUp(self):
+        from buybot import promo
+        self.p = promo
+
+    def test_texts_lose_what_cannot_be_drawn_safely(self):
+        c = self.p.clean
+        self.assertEqual(c("Silverhand Buys", 40), "Silverhand Buys")
+        self.assertEqual(c("\U0001f438 Pepe \U0001f680", 40), "Pepe")             # emoji
+        self.assertEqual(c("‮evil‬ name​", 40), "evil name")         # bidi, zero width
+        self.assertEqual(c("שלום Coin", 40), "Coin")            # RTL: no shaping here
+        self.assertEqual(c("مرحبا", 40), "")
+        self.assertEqual(c("ＦＵＬＬ\nline\ttwo", 40), "FULL line two")  # NFKC, one line
+        self.assertEqual(c("x" * 500, 40), "x" * 40)
+        self.assertEqual(c(None, 40), "")
+        self.assertEqual(self.p.clean_symbol("$DO GE\U0001f680"), "DOGE")
+
+    def test_logo_checks(self):
+        ok = self.p.open_logo(png(64, 32, "RGBA"))
+        self.assertEqual((ok.mode, ok.size), ("RGBA", (64, 32)))
+        self.assertEqual(self.p.open_logo(png(900, 900)).size, (512, 512))   # kept at most 512 px
+        svg = b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'
+        self.assertIsNone(self.p.open_logo(svg))
+        self.assertIsNone(self.p.open_logo(png(3000, 4)))                    # a side over 2048 px
+        self.assertIsNone(self.p.open_logo(b"\x89PNG\r\n\x1a\n" + b"\0" * 100))  # broken
+        self.assertIsNone(self.p.open_logo(b"GIF89a" + b"\0" * 100))         # not on the list
+        self.assertIsNone(self.p.open_logo(png(8, 8) + b"\0" * self.p.LOGO_MAX))  # too many bytes
+        self.assertIsNone(self.p.open_logo(None))
+        # a "bomb": a tiny file that claims a huge picture is refused before decoding
+        import struct
+        import zlib
+        bomb = bytearray(png(1, 1))
+        bomb[16:24] = struct.pack(">II", 60000, 60000)
+        bomb[29:33] = struct.pack(">I", zlib.crc32(bytes(bomb[12:29])))
+        self.assertIsNone(self.p.open_logo(bytes(bomb)))
+
+    def test_logo_only_from_vibe_media_by_ipfs_id(self):
+        cid = "bafkreicwr5vqkle4qspblzcj4g7ibmtxwc37ixiqe2ruqyovcikktzgp4m"
+        self.assertEqual(self.p.logo_urls(f"ipfs://{cid}"),
+                         [f"https://testnet.vibevibe.fun/media/{cid}.sq410.webp",
+                          f"https://testnet.vibevibe.fun/media/{cid}.thumb.webp"])
+        for bad in ("https://evil.example/x.png", "ipfs://../../etc", f"ipfs://{cid}/x", "ipfs://ABC123XYZ",
+                    "data:image/svg+xml,<svg/>", None, 42):
+            self.assertEqual(self.p.logo_urls(bad), [], bad)
+
+    def test_api_facts(self):
+        api = VIBE_API
+        shbuys = api["v6_launch"]["launch"]["tokenAddress"]
+        f = self.p.api_facts(None, api["v6_launch"], api["v6_search"]["items"][0], None, shbuys.upper().replace("0X", "0x"))
+        self.assertEqual((f["holders"], f["buys_24h"]), (5, 7))
+        self.assertTrue(f["image"].startswith("ipfs://bafkrei"))
+        kyle = api["curve_launch"]["tokenAddress"]
+        f = self.p.api_facts(api["curve_launch"], None, None, api["curve_candles"], kyle)
+        self.assertEqual((f["holders"], f["buys_24h"]), (1118, 515))
+        # an answer about another token, or with nonsense counts, gives nothing
+        f = self.p.api_facts(api["curve_launch"], None, None, api["curve_candles"], shbuys)
+        self.assertEqual(f, {"holders": None, "buys_24h": None, "image": None})
+        bad = dict(api["v6_search"]["items"][0], market={"holderCount": -3, "buyCount24h": "lots"})
+        f = self.p.api_facts(None, None, bad, None, shbuys)
+        self.assertEqual((f["holders"], f["buys_24h"]), (None, None))
+
+    def spec(self, token=None, state=None, rate=1500.0, kind="ethpool:0xq:0xp"):
+        token = token or fixture_token(kind="vibe", quote_kind=kind, quote_symbol="AAPL", pair="0x" + "44" * 20,
+                                       symbol="\U0001f680SH<b>", name="Silver <i>hand</i>")
+        state = state or vibe.State(token=TOKEN, quote=token.pair, target=4 * ETH, real_quote=ETH, tokens_left=600 * 10 ** 24,
+                                    tokens_sold=200 * 10 ** 24, complete=False, pool_id=None)
+
+        class Rates:
+            async def get(self, k):
+                return rate if k == kind else None
+
+        async def fake_state(rpc, curve, factory=None):
+            return state
+        real = vibe.state
+        vibe.state = fake_state
+        try:
+            return run(self.p.gather(None, None, Rates(), TOKEN, token=token, bot="@b"))
+        finally:
+            vibe.state = real
+
+    def test_spec_from_the_chain(self):
+        spec, logo = self.spec()
+        self.assertIsNone(logo)
+        self.assertEqual((spec["symbol"], spec["name"], spec["pair"]), ("SH<b>", "Silver <i>hand</i>", "AAPL"))
+        self.assertAlmostEqual(spec["progress"], 0.25)
+        # a V6 curve: its % is the quote raised of the target, as vibe/vibe's site shows it
+        self.assertEqual((spec["raised"], spec["target"], spec["sold"]), (1.0, 4.0, None))
+        # a curve-factory curve (it reports its virtual tokens): the curve's tokens sold
+        c_state = vibe.State(TOKEN, "0x" + "44" * 20, 4 * ETH, ETH, 600 * 10 ** 24, 200 * 10 ** 24, False, None,
+                             virtual_quote0=ETH, virtual_tokens=100 * 10 ** 24)
+        c_spec, _ = self.spec(state=c_state)
+        self.assertEqual((c_spec["sold"], c_spec["curve_tokens"], c_spec["raised"]), (200e6, 800e6, None))
+        st = vibe.State(TOKEN, "0x" + "44" * 20, 4 * ETH, ETH, 600 * 10 ** 24, 200 * 10 ** 24, False, None)
+        self.assertAlmostEqual(spec["mc_quote"], st.price() * 10 ** 9)
+        self.assertAlmostEqual(spec["mc_usd"], spec["mc_quote"] * 1500)
+        self.assertTrue(spec["mc_approx"])                       # dollars from a pool price
+        self.assertIsNone(spec["holders"])                       # no API: no tile, no guess
+        spec, _ = self.spec(rate=None)
+        self.assertIsNone(spec["mc_usd"])
+        with self.assertRaises(self.p.PromoError):
+            self.spec(token=fixture_token(kind="pons"))
+
+    def test_caption_escapes_and_states_facts_only(self):
+        spec, _ = self.spec()
+        spec.update(holders=1234, buys_24h=56)
+        text = self.p.caption(spec, "en", now=0)
+        self.assertIn("$SH&lt;b&gt;", text)
+        self.assertNotIn("<i>hand", text)
+        self.assertIn("25.0% of the bonding curve filled, 1,234 holders", text)
+        self.assertIn(f"CA {TOKEN}", text)
+        self.assertIn("00:00 UTC", text)
+        for word in ("price", "moon", "x100", "partner", "endorse", "guarantee"):
+            self.assertNotIn(word, text.lower())
+
+    def test_cache_key_follows_the_facts_drawn(self):
+        spec, _ = self.spec()
+        key = self.p.cache_key(spec, None)
+        self.assertEqual(key, self.p.cache_key(dict(spec, mc_usd=spec["mc_usd"] * 1.0001), None))
+        self.assertNotEqual(key, self.p.cache_key(dict(spec, progress=spec["progress"] + 0.01), None))
+        self.assertNotEqual(key, self.p.cache_key(dict(spec, holders=7), None))
+        self.assertNotEqual(key, self.p.cache_key(spec, object()))
+
+    def test_limits(self):
+        lim = self.p.Limiter(((60, 1), (3600, 3)))
+        self.assertEqual(lim.allow("u", 0), 0)
+        self.assertAlmostEqual(lim.allow("u", 10), 50)
+        self.assertEqual(lim.allow("v", 10), 0)          # someone else
+        self.assertEqual(lim.allow("u", 61), 0)
+        self.assertEqual(lim.allow("u", 130), 0)
+        self.assertAlmostEqual(lim.allow("u", 200), 3400)  # three in the hour
+        self.assertEqual(lim.allow("u", 3601), 0)
+
+    def test_cache_and_queue(self):
+        promos = self.p.Promos()
+        promos.keep_video("k", "file1")
+        self.assertEqual(promos.cached_video("k"), "file1")
+        promos.videos["k"] = (time.time() - self.p.CACHE_TTL - 1, "file1")
+        self.assertIsNone(promos.cached_video("k"))
+        promos.waiting = self.p.MAX_WAITING
+        with self.assertRaises(self.p.PromoError) as e:
+            run(promos.render({}, None))
+        self.assertEqual(e.exception.key, "promo_busy")
+
+    def test_render_is_one_at_a_time_and_after_cards(self):
+        from buybot import heavy, promo_video
+        log, real = [], promo_video.render
+
+        def fake(spec, logo, style="dashboard"):
+            log.append(spec["n"])
+            time.sleep(0.05)
+            return b"mp4"
+
+        async def go():
+            promos = self.p.Promos()
+            async with heavy.slot():  # a buy card is being drawn: the promo waits for it
+                task = asyncio.ensure_future(promos.render({"n": 1}, None))
+                await asyncio.sleep(0.05)
+                self.assertEqual(log, [])
+            return await asyncio.gather(task, promos.render({"n": 2}, None))
+        promo_video.render = fake
+        try:
+            self.assertEqual(run(go()), [b"mp4", b"mp4"])
+        finally:
+            promo_video.render = real
+        self.assertEqual(log, [1, 2])
+
+    def test_a_small_render(self):
+        from buybot import chart, promo_video
+        if not chart.find_ffmpeg():
+            self.skipTest("no ffmpeg")
+        spec, _ = self.spec()
+        spec.update(holders=5, buys_24h=7, testnet=True, network="Robinhood Chain testnet")
+        data = promo_video.render(spec, self.p.open_logo(png(64, 64)), size=(160, 200), fps=6, seconds=1.0)
+        self.assertEqual(data[4:8], b"ftyp")
+        for t in (0, 2.5, 4.0, 6.5):  # every scene draws, graduated too
+            promo_video.still(dict(spec, graduated=True), None, t, size=(160, 200))
+        data = promo_video.render(spec, None, size=(160, 200), fps=4, seconds=1.0, style="terminal")
+        self.assertEqual(data[4:8], b"ftyp")
+
+    def test_every_style_draws_every_scene(self):
+        from buybot import promo_styles, promo_video
+        self.assertEqual(tuple(promo_styles.STYLES), self.p.STYLES)  # the bot's list, without Pillow
+        self.assertEqual(set(promo_styles.NAMES), set(self.p.STYLES))
+        spec, _ = self.spec()
+        spec.update(holders=5, buys_24h=7, testnet=True, network="Robinhood Chain testnet", bot="@b")
+        sparse = dict(spec, holders=None, buys_24h=None, mc_usd=None, mc_quote=None, raised=None, testnet=False)
+        long = dict(spec, symbol="W" * 16, name="W" * 40, pair="WWWWWWWWWWWW", mc_usd=123456789012.0)
+        logo = self.p.open_logo(png(64, 64))
+        for style in self.p.STYLES:
+            for s in (spec, dict(spec, graduated=True, progress=1.0, raised=None), sparse, long):
+                v = promo_video.video(s, logo, style, size=(160, 200))
+                self.assertIsInstance(v, promo_styles.STYLES[style])
+                for t in (0, 1.2, 2.5, 3.3, 4.4, 5.5, 6.2, 7.3):
+                    v.frame(t).close()
+        self.assertIsInstance(promo_video.video(spec, None, "nonsense", size=(160, 200)), promo_video.Video)
 
 
 if __name__ == "__main__":

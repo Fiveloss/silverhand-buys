@@ -14,21 +14,11 @@ what the bot sets itself.
 The animation is made by `tools/make_intro.py` from the avatar
 (`--title`, `--sub` and `--eyebrow` change its text).
 
-## Set by the bot itself
+The testnet bot (@silverhandbuysTNbot) takes `assets/brand/avatar-testnet.png` and
+[`assets/brand/botfather-description-testnet.gif`](../assets/brand/botfather-description-testnet.gif).
+That picture and its menu screens (`assets/menu/en`, English only) are drawn in the trade card's
+vibe/vibe style: the card's header with the TESTNET pill, a bar filling to graduation and a small
+chart rising with it, a seamless 3 s loop:
 
-On every start the bot sets its command menus in each of its languages (one for groups, one for the
-private chat) and its profile texts, so `/setcommands`, `/setdescription` and
-`/setabouttext` are not needed. Edits made there are overwritten on the next
-restart: change the texts in [`buybot/profile.py`](../buybot/profile.py).
-
-Both texts come in English, the default, and in each other language the bot speaks,
-which Telegram shows to users whose app is in that language. The tests check them
-against Telegram's limits (counted in UTF-16 units):
-
-| Text | Where it shows | English |
-|---|---|---|
-| description | an empty chat with the bot, under the picture | 399 of 512 |
-| about | the bot's profile and link previews | 107 of 120 |
-
-Another language is one more key (its two-letter code) in `DESCRIPTIONS` and
-`SHORT_DESCRIPTIONS`.
+    python tools/make_screens.py            # the menu screens
+    python tools/make_screens.py --brand    # the description picture

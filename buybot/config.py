@@ -3,6 +3,7 @@
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 def load_dotenv(path: str | Path) -> None:
@@ -38,15 +39,21 @@ class Config:
     support_contact: str = ""
     source_url: str = ""
     log_level: str = "INFO"
+    langs: tuple[str, ...] = ("en", "ru")  # LANGS=en: English only (no Russian profile, menu or picker)
+    webapp_url: str = ""   # WEBAPP_URL: the Mini App's public https address (webapp.py); empty: no Mini App
+    webapp_port: int = 0   # WEBAPP_PORT: where the bot serves it on 127.0.0.1 for the tunnel
+    chain_id: int = 4663
+    db_chain_id: int | None = None  # explicit one-time confirmation for an unlabelled legacy DB
 
 
 # The free public RPC sits behind Cloudflare, which shuts out an IP that asks too often:
 # with it, the watcher looks for new blocks at most this often (a tick is one batch).
 PUBLIC_POLL_FLOOR = 5.0
+PUBLIC_RPCS = {Config.rpc_url, "https://rpc.testnet.chain.robinhood.com"}
 
 
 def poll_seconds(rpc_url: str, wanted: float) -> float:
-    return max(wanted, PUBLIC_POLL_FLOOR) if rpc_url.rstrip("/") == Config.rpc_url else wanted
+    return max(wanted, PUBLIC_POLL_FLOOR) if rpc_url.rstrip("/") in PUBLIC_RPCS else wanted
 
 
 def load_config(env_file: str | Path = ".env") -> Config:
@@ -56,6 +63,19 @@ def load_config(env_file: str | Path = ".env") -> Config:
         raise SystemExit("BOT_TOKEN is not set (see .env.example)")
     e = os.environ.get
     rpc_url = e("RPC_URL", Config.rpc_url)
+    chain_id = int(e("CHAIN_ID", "46630" if rpc_url.rstrip("/") ==
+                     "https://rpc.testnet.chain.robinhood.com" else "4663"))
+    if chain_id not in (4663, 46630):
+        raise SystemExit("CHAIN_ID must be 4663 (mainnet) or 46630 (testnet)")
+    webapp_url = e("WEBAPP_URL", "").strip().rstrip("/")
+    webapp_port = int(e("WEBAPP_PORT", "0") or 0)
+    parsed = urlsplit(webapp_url)
+    if webapp_url and (parsed.scheme != "https" or not parsed.hostname or parsed.username or
+                       parsed.password or parsed.path or parsed.query or parsed.fragment):
+        raise SystemExit("WEBAPP_URL must be an HTTPS origin, without a path, credentials, query or fragment")
+    if not 0 <= webapp_port <= 65535 or bool(webapp_url) != bool(webapp_port):
+        raise SystemExit("Set WEBAPP_URL and WEBAPP_PORT (1-65535) together, or leave both disabled")
+    testnet = chain_id == 46630
     return Config(
         bot_token=token,
         owner_ids=_ids(e("OWNER_IDS", "")),
@@ -63,9 +83,16 @@ def load_config(env_file: str | Path = ".env") -> Config:
         db_path=e("DB_PATH", Config.db_path),
         poll_seconds=poll_seconds(rpc_url, float(e("POLL_SECONDS", Config.poll_seconds))),
         rpc_min_interval=float(e("RPC_MIN_INTERVAL", Config.rpc_min_interval)),
-        explorer_url=e("EXPLORER_URL", Config.explorer_url).rstrip("/"),
-        trade_url=e("TRADE_URL", Config.trade_url),
+        explorer_url=e("EXPLORER_URL", "https://explorer.testnet.chain.robinhood.com"
+                       if testnet else Config.explorer_url).rstrip("/"),
+        trade_url=e("TRADE_URL", "https://testnet.vibevibe.fun/token/{token}"
+                    if testnet else Config.trade_url),
         support_contact=e("SUPPORT_CONTACT", ""),
         source_url=e("SOURCE_URL", ""),
         log_level=e("LOG_LEVEL", "INFO"),
+        langs=tuple(x for x in e("LANGS", "en,ru").replace(" ", "").lower().split(",") if x) or ("en",),
+        webapp_url=webapp_url,
+        webapp_port=webapp_port,
+        chain_id=chain_id,
+        db_chain_id=int(e("DB_CHAIN_ID")) if e("DB_CHAIN_ID") else None,
     )

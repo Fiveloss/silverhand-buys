@@ -35,6 +35,7 @@ EX = (3, 44, 26)
 INK = (236, 244, 240)
 GLINT = (228, 255, 240)
 TAPE_K = (5, 10, 8)
+LIME = (223, 249, 2)    # the testnet bot's colour (its avatar's badge)
 
 DISPLAY_FONTS = [
     ("C:/Windows/Fonts/bahnschrift.ttf", "Bold Condensed"),
@@ -124,7 +125,7 @@ def vgradient(w, h, stops):
     return col.resize((w, h))
 
 
-def tape(w, band, phase):
+def tape(w, band, phase, color=ACC):
     """Signal tape; phase 0..1 moves the stripes by exactly one period."""
     img = Image.new("RGB", (w, band), TAPE_K)
     d = ImageDraw.Draw(img)
@@ -132,8 +133,13 @@ def tape(w, band, phase):
     off = phase * p
     for x0 in range(-3 * p, w + 3 * p, p):
         x = x0 + off
-        d.polygon([(x, 0), (x + p / 2, 0), (x + p / 2 - band, band), (x - band, band)], fill=ACC)
+        d.polygon([(x, 0), (x + p / 2, 0), (x + p / 2 - band, band), (x - band, band)], fill=color)
     return img
+
+
+def ease_io(p):
+    p = min(max(p, 0.0), 1.0)
+    return p * p * (3 - 2 * p)
 
 
 def circle_logo(path, size):
@@ -148,10 +154,15 @@ def circle_logo(path, size):
 
 
 class Scene:
-    def __init__(self, W, H, S, title, eyebrow, sub, logo_path, seed=7, pad_left=0):
+    def __init__(self, W, H, S, title, eyebrow, sub, logo_path, seed=7, pad_left=0,
+                 badge=None, badge_color=None, gauge=False):
         """pad_left keeps the logo and text clear of the image's left edge (in layout
-        units), e.g. where X lays the profile picture over its header."""
+        units), e.g. where X lays the profile picture over its header.
+        badge: a pill after the eyebrow (e.g. "TESTNET") in badge_color, which also
+        colours the tapes. gauge: the ring around the logo fills like a bonding curve,
+        flashes at graduation and empties again, instead of spinning."""
         self.W, self.H, self.S = W, H, S
+        self.badge, self.badge_color, self.gauge = badge, badge_color or ACC, gauge
         self.w, self.h = w, h = W * S, H * S
         self.band = 12 * S
         self.title, self.eyebrow, self.sub = title, eyebrow, sub
@@ -209,6 +220,10 @@ class Scene:
         self.ey_track = 3 * S
         self.sub_track = 1.6 * S
         ey_w = spaced_width(probe, eyebrow, self.ey_font, self.ey_track)
+        self.badge_font = mono_font(11 * S)
+        if badge:
+            self.badge_w = spaced_width(probe, badge, self.badge_font, 2 * S) + 14 * S
+            ey_w += 10 * S + self.badge_w
         sub_w = spaced_width(probe, sub, self.sub_font, self.sub_track) + 14 * S
         gap = 22 * S
         avail = w - pad_left * S
@@ -356,12 +371,15 @@ class Scene:
         img = Image.composite(Image.new("RGB", (w, h), ACC), img, halo)
         d = ImageDraw.Draw(img)
         rr = ls / 2 + 8 * S
-        base = 360 * t
-        steps = 48
-        for i in range(steps):
-            a0 = base + i * (150 / steps)
-            d.arc((cx - rr, cy - rr, cx + rr, cy + rr), a0, a0 + 150 / steps + .8,
-                  fill=mix(ACC, BG, i / steps), width=3 * S)
+        if self.gauge:
+            self._gauge(d, t, cx, cy, rr)
+        else:
+            base = 360 * t
+            steps = 48
+            for i in range(steps):
+                a0 = base + i * (150 / steps)
+                d.arc((cx - rr, cy - rr, cx + rr, cy + rr), a0, a0 + 150 / steps + .8,
+                      fill=mix(ACC, BG, i / steps), width=3 * S)
         d.ellipse((lx - 2 * S, ly - 2 * S, lx + ls + 2 * S, ly + ls + 2 * S), fill=(0, 0, 0))
         img.paste(self.logo, (lx, ly), self.logo_mask)
 
@@ -397,15 +415,66 @@ class Scene:
 
         d = ImageDraw.Draw(img)
         # The line above the title, and the one below with a blinking cursor.
-        spaced(d, self.ey_xy, self.eyebrow, self.ey_font, ACC, self.ey_track)
+        end_ey = spaced(d, self.ey_xy, self.eyebrow, self.ey_font, ACC, self.ey_track)
+        if self.badge:
+            img = self._badge(img, end_ey - self.ey_track + 10 * S, t)
+            d = ImageDraw.Draw(img)
         end = spaced(d, self.sub_xy, self.sub, self.sub_font, INK, self.sub_track)
         if (t * 4) % 1 < .5:
             d.rectangle((end + 4 * S, self.sub_xy[1] + 2 * S, end + 12 * S, self.sub_xy[1] + 16 * S), fill=ACC)
 
         img = Image.composite(Image.new("RGB", (w, h), (0, 0, 0)), img, self.scan)
-        img.paste(tape(w, self.band, t), (0, 0))
-        img.paste(tape(w, self.band, t), (0, h - self.band))
+        img.paste(tape(w, self.band, t, self.badge_color), (0, 0))
+        img.paste(tape(w, self.band, t, self.badge_color), (0, h - self.band))
         return img.resize((self.W, self.H), Image.LANCZOS)
+
+    # The curve's story in one loop: it fills (eased, about 2.3 s of 3), flashes
+    # when full, and empties, so t=0 and t=1 are the same empty ring.
+    FILL_END, FLASH_END = .76, .9
+
+    def _gauge(self, d, t, cx, cy, rr):
+        S = self.S
+        box = (cx - rr, cy - rr, cx + rr, cy + rr)
+        track = mix(ACC, BG, .16)
+        d.arc(box, 0, 360, fill=track, width=3 * S)
+        if t < self.FILL_END:
+            level, flash, fade = ease_io(t / self.FILL_END), 0.0, 0.0
+        elif t < self.FLASH_END:
+            level, flash, fade = 1.0, 1 - (t - self.FILL_END) / (self.FLASH_END - self.FILL_END), 0.0
+        else:
+            level, flash, fade = 1.0, 0.0, ease_io((t - self.FLASH_END) / (1 - self.FLASH_END))
+        if level > .003:
+            col = mix(track, mix(HI, ACC, flash), fade)
+            d.arc(box, -90, -90 + 360 * level, fill=col, width=(3 + round(2 * flash)) * S)
+        # where the curve stands, under the ring
+        if t < self.FILL_END:
+            text, col = f"CURVE {level * 100:.0f}%", mix(INK, BG, .75)
+        else:
+            text, col = "GRADUATED", mix(BG, self.badge_color, fade)
+        tw = spaced_width(d, text, self.badge_font, 2 * S)
+        spaced(d, (cx - tw / 2, cy + rr + 8 * S), text, self.badge_font, col, 2 * S)
+
+    def _badge(self, img, x, t):
+        """The pill after the eyebrow; a glint crosses it with the graduation flash."""
+        S = self.S
+        y0, y1 = self.ey_xy[1] - 2 * S, self.ey_xy[1] + 15 * S
+        x1 = x + self.badge_w
+        d = ImageDraw.Draw(img)
+        d.rounded_rectangle((x, y0, x1, y1), radius=4 * S, fill=self.badge_color)
+        top = d.textbbox((0, 0), self.badge, font=self.badge_font)
+        spaced(d, (x + 7 * S, y0 + (y1 - y0 - (top[3] - top[1])) / 2 - top[1]), self.badge,
+               self.badge_font, BG, 2 * S)
+        k = (t - self.FILL_END) / (self.FLASH_END - self.FILL_END) if self.gauge else t
+        if 0 < k < 1:
+            sx = x - 20 * S + (x1 - x + 40 * S) * ease_io(k)
+            band = Image.new("L", img.size, 0)
+            ImageDraw.Draw(band).polygon([(sx, y0), (sx + 10 * S, y0), (sx + 4 * S, y1), (sx - 6 * S, y1)],
+                                         fill=170)
+            pill = Image.new("L", img.size, 0)
+            ImageDraw.Draw(pill).rounded_rectangle((x, y0, x1, y1), radius=4 * S, fill=255)
+            band = ImageChops.multiply(band.filter(ImageFilter.GaussianBlur(2 * S)), pill)
+            img = Image.composite(Image.new("RGB", img.size, (255, 255, 236)), img, band)
+        return img
 
 
 def find_ffmpeg():
@@ -446,6 +515,8 @@ def main():
     ap.add_argument("--fps", type=int, default=20)
     ap.add_argument("--seconds", type=float, default=3.0)
     ap.add_argument("--logo", default=str(BRAND / "avatar.png"))
+    ap.add_argument("--testnet", action="store_true",
+                    help="the testnet bot's picture: a lime TESTNET badge and tapes, the ring as a curve gauge")
     ap.add_argument("--no-mp4", action="store_true")
     ap.add_argument("--still", type=float, action="append", default=[],
                     help="also save the frame at this fraction of the loop as PNG (repeatable)")
@@ -464,8 +535,9 @@ def main():
             (Path(a.menu_dir) / lang).mkdir(parents=True, exist_ok=True)
     else:
         jobs = [(Path(a.out), a.eyebrow, a.title, a.sub, True, not a.no_mp4)]
+    extra = dict(badge="TESTNET", badge_color=LIME, gauge=True) if a.testnet else {}
     for out, eyebrow, title, sub, want_gif, want_mp4 in jobs:
-        scene = Scene(W, H, 2, title, eyebrow, sub, a.logo)
+        scene = Scene(W, H, 2, title, eyebrow, sub, a.logo, **extra)
         for t in a.still:
             scene.frame(t).save(out.with_name(f"{out.name}-{t:.2f}.png"))
         frames = [scene.frame(i / n) for i in range(n)]

@@ -52,6 +52,7 @@ class Rpc:
         self.calls = 0
         self.errors = 0
         self.challenges = 0
+        self._chain_id: int | None = None
 
     async def _slot(self) -> None:
         async with self._lock:
@@ -179,6 +180,12 @@ class Rpc:
         for q, r in zip(queries, results):
             out.append(await self.get_logs(*q) if isinstance(r, RpcError) else (r or []))
         return out
+
+    async def chain_id(self) -> int:
+        """The chain's id, asked once: 4663 mainnet, 46630 testnet."""
+        if self._chain_id is None:
+            self._chain_id = int(await self.call("eth_chainId", []), 16)
+        return self._chain_id
 
     async def block_number(self) -> int:
         return int(await self.call("eth_blockNumber", []), 16)

@@ -97,7 +97,8 @@ def buy_text(p: dict, chat: Chat, more: list[dict] | None = None, *, explorer: s
         title += f" · 🐋 <b>{t(lang, 'post_whale')}</b>"
     lines += [title, ""]  # one mark says buy or sell; the size is in the numbers below
 
-    lines.append(("💰 " if sell else "💵 ") + _money(p["quote"], p["quote_symbol"], p.get("usd")))
+    approx = bool(p.get("usd_approx"))  # dollars from a pool price (testnet stock tokens)
+    lines.append(("💰 " if sell else "💵 ") + _money(p["quote"], p["quote_symbol"], p.get("usd"), approx))
     tree = [f"{t(lang, 'post_sold' if sell else 'post_got')} <b>{fmt_compact(p['tokens'])}</b> {sym}"]
     if p.get("buyer"):
         who = short_addr(p["buyer"])
@@ -106,7 +107,7 @@ def buy_text(p: dict, chat: Chat, more: list[dict] | None = None, *, explorer: s
         note = dev_sold_line(p.get("holder"), lang) if dev_sell else holder_line(p.get("holder"), lang)
         tree.append(f"{'👨‍💻' if dev_sell else '👤'} {who}" + (f" · {note}" if note else ""))
     if p.get("mc_usd") is not None:
-        tree.append(f"📊 MC <b>{fmt_usd(p['mc_usd'])}</b>")
+        tree.append(f"📊 MC <b>{'≈' if approx else ''}{fmt_usd(p['mc_usd'])}</b>")
     elif p.get("mc_quote") is not None:
         mc_symbol = p.get("mc_symbol") or p["quote_symbol"]
         tree.append(f"📊 MC <b>{fmt_compact(p['mc_quote'])} {escape(mc_symbol)}</b>")
@@ -122,7 +123,8 @@ def buy_text(p: dict, chat: Chat, more: list[dict] | None = None, *, explorer: s
                 plural(len(more), lang, ("buy", "buys"), ("покупка", "покупки", "покупок")))
         line = t(lang, "post_more", n=len(more), word=word)
         if all(m.get("quote_symbol", p["quote_symbol"]) == p["quote_symbol"] for m in more):
-            line += " " + _money(sum(m["quote"] for m in more), p["quote_symbol"], usd)
+            line += " " + _money(sum(m["quote"] for m in more), p["quote_symbol"], usd,
+                                 approx or any(m.get("usd_approx") for m in more))
         elif usd is not None:  # trades in different quotes: only dollars add up
             line += f" <b>{fmt_usd(usd)}</b>"
         tree.append(line)
@@ -176,15 +178,20 @@ def dev_sold_line(h: dict | None, lang: str) -> str | None:
     return t(lang, "post_dev_sold", pct=f"{min(-change * 100, 100):.0f}%", share=fmt_share(h.get("share", 0)))
 
 
-def _money(value: float, symbol: str, usd: float | None) -> str:
+def _money(value: float, symbol: str, usd: float | None, approx: bool = False) -> str:
     """Dollars first when known: <b>$1,050</b> · 0.35 ETH; else <b>0.35 XYZ</b>."""
     amount = f"{fmt_num(value)} {escape(symbol)}"
-    return f"<b>{fmt_usd(usd)}</b> · {amount}" if usd is not None else f"<b>{amount}</b>"
+    if usd is None:
+        return f"<b>{amount}</b>"
+    return f"<b>{'≈' if approx else ''}{fmt_usd(usd)}</b> · {amount}"
 
 
 def milestone_text(p: dict, lang: str = "en") -> str:
-    """🚀 TST hit $50K market cap! / 🎓 TST: the bonding curve is 75% full."""
+    """🚀 TST hit $50K market cap! / 🎓 TST: the bonding curve is 75% full. /
+    👥 TST has 500 holders!"""
     sym = escape(p["symbol"])
+    if p["what"] == "holders":
+        return t(lang, "post_level_holders", symbol=sym, level=f"{p['level']:,}")
     if p["what"] == "mc":
         return t(lang, "post_level_mc", symbol=sym, level=fmt_usd(p["level"]).replace(",000", "K")
                  if p["level"] < 1_000_000 else fmt_usd(p["level"]))
@@ -198,9 +205,81 @@ def graduation_text(p: dict, lang: str = "en") -> str:
              dex=escape(p.get("dex") or "Uniswap v4"))
 
 
-def buttons(p: dict, trade_url: str, explorer: str) -> list[tuple[str, str, str | None]]:
+def alert_text(p: dict) -> str:
+    """The private alert of a sharp drop (watcher.dump_alerts), in the chat's language."""
+    lang = p.get("lang") or "en"
+    rate = p.get("rate")
+
+    def cap(q: float) -> str:
+        return (("≈" if p.get("usd_approx") else "") + fmt_usd(q * rate)) if rate else \
+            f"{fmt_compact(q)} {escape(p['quote_symbol'])}"
+
+    return t(lang, "alert_dump", symbol=escape(p["symbol"]), pct=round(p["drop"] * 100),
+             chat=escape(p.get("chat") or ""), hi=cap(p["mc_high"]), now=cap(p["mc_now"]))
+
+
+def digest_text(p: dict, lang: str = "en") -> str:
+    """The daily digest (digest.py): the token's last 24 hours."""
+    sym = escape(p["quote_symbol"])
+    rate = p.get("rate")
+
+    def money(q: float) -> str:
+        return f"≈{fmt_usd(q * rate)}" if rate else f"{fmt_num(q)} {sym}"
+
+    def cap(q: float) -> str:
+        return (("≈" if p.get("usd_approx") else "") + fmt_usd(q * rate)) if rate else f"{fmt_compact(q)} {sym}"
+
+    lines = [t(lang, "digest_title", symbol=escape(p["symbol"])), ""]
+    lines.append(t(lang, "digest_buys", n=p["buys"], v=money(p["buy_volume"]),
+                   word=plural(p["buys"], lang, ("buy", "buys"), ("покупка", "покупки", "покупок"))))
+    lines.append(t(lang, "digest_sells", n=p["sells"], v=money(p["sell_volume"]),
+                   word=plural(p["sells"], lang, ("sell", "sells"), ("продажа", "продажи", "продаж"))))
+    if p.get("buyers"):
+        lines.append(t(lang, "digest_buyers", n=p["buyers"]))
+    change = "" if p.get("change") is None else f" · {'▲' if p['change'] >= 0 else '▼'} {abs(p['change']) * 100:.1f}%"
+    lines.append(t(lang, "digest_mc", mc=cap(p["mc_now"]), change=change))
+    if p.get("top"):
+        lines += ["", t(lang, "digest_top")]
+        for medal, (wallet, quote) in zip(("🥇", "🥈", "🥉"), p["top"]):
+            lines.append(f"{medal} {short_addr(wallet)} · <b>{money(quote)}</b>")
+    return "\n".join(lines)
+
+
+def share_text(p: dict, kind: str) -> str | None:
+    """What the 𝕏 Share button puts in a new post: the buy, the level or the graduation
+    in one line. None for what nobody shares (a sell)."""
+    sym = "$" + p["symbol"]
+    approx = "≈" if p.get("usd_approx") else ""
+    if kind == "buy":
+        money = (approx + fmt_usd(p["usd"])) if p.get("usd") is not None else \
+            f"{fmt_num(p['quote'])} {p.get('quote_symbol', '')}".strip()
+        line = f"🟢 {sym} buy: {money}"
+        if p.get("mc_usd") is not None:
+            line += f" · MC {approx}{fmt_usd(p['mc_usd'])}"
+        return line
+    if kind == "milestone":
+        if p.get("what") == "mc":
+            level = fmt_usd(p["level"]).replace(",000", "K") if p["level"] < 1_000_000 else fmt_usd(p["level"])
+            return f"🚀 {sym} hit {level} market cap"
+        if p.get("what") == "holders":
+            return f"👥 {sym} has {p['level']:,} holders"
+        return f"🎓 {sym}: the bonding curve is {round(p['level'] * 100)}% full"
+    if kind == "grad":
+        return f"🎓 {sym} graduated to {p.get('dex') or 'Uniswap v4'}"
+    return None
+
+
+def share_url(text: str, link: str = "") -> str:
+    """An X compose link with the text (and the token's page) filled in."""
+    from urllib.parse import quote
+    body = text + ("\n\n" + link if link else "") + "\n\nvia Silverhand Buys"
+    return "https://x.com/intent/post?text=" + quote(body, safe="")
+
+
+def buttons(p: dict, trade_url: str, explorer: str, share: str | None = None) -> list:
     """(label, link or callback, colour): the chart is the green one, the 24h pop-up blue;
-    the scan's pop-up last."""
+    the scan's pop-up last. With `share` (share_text), a second row: 𝕏 Share (None in the
+    list starts a new row)."""
     out = []
     if trade_url:
         out.append(("📈 Chart", trade_url.format(token=p["token"]), "success"))
@@ -209,6 +288,9 @@ def buttons(p: dict, trade_url: str, explorer: str) -> list[tuple[str, str, str 
     if p.get("token"):
         out.append(("🕐 24h", f"s:{p['token']}", "primary"))  # a pop-up for whoever taps it, not a message
         out.append(("🛡 Scan", f"x:{p['token']}", None))       # the /scan summary, a pop-up too
+    if share:
+        link = trade_url.format(token=p["token"]) if trade_url and p.get("token") else ""
+        out += [None, ("𝕏 Share", share_url(share, link), None)]
     return out
 
 

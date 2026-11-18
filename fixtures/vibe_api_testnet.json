@@ -1,0 +1,410 @@
+{
+ "_about": "vibe/vibe's public read API on testnet (testnet.vibevibe.fun/api/v1/chains/46630), 2026-10-19: $SHBUYS (V6, AAPL pair) and $KYLE (curve factory, ETH), 'data' of each answer; candles cut to their counts.",
+ "v6_launch": {
+  "launch": {
+   "tokenAddress": "0x7ca1e72987d3c1bf347e8f13398c208a528ebed5",
+   "curveAddress": "0x3e4b77480a7a5206bbd30e997901263f506f9d56",
+   "launcherAddress": "0x3a20f86e6124f8ce0aa4a035299872bf2dcf42b8",
+   "factoryAddress": "0xe794217880011f9ca6961340ed5c16ec9559fea0",
+   "launchId": "16049",
+   "name": "Silverhand Buys",
+   "symbol": "SHBUYS",
+   "metadataURI": "ipfs://bafkreidygpkfqx32qznyviinegogygidhkri5fsaix3ij2zotvgxfqdeii",
+   "content": {
+    "description": "Demo token for Silverhand Buys, a Telegram buy bot for vibe/vibe launches on Robinhood Chain. Add @silverhandbuysTNbot to a group, /track a token, and every buy gets posted live with curve progress and new holders. Testnet only, no value.",
+    "image": {
+     "uri": "ipfs://bafkreicwr5vqkle4qspblzcj4g7ibmtxwc37ixiqe2ruqyovcikktzgp4m",
+     "mimeType": "image/webp",
+     "bytes": 86252,
+     "width": 640,
+     "height": 640,
+     "renders": {
+      "thumb": [
+       96,
+       96
+      ],
+      "sq410": [
+       410,
+       410
+      ],
+      "sq544": [
+       544,
+       544
+      ],
+      "card": [
+       640,
+       640
+      ]
+     }
+    },
+    "socials": {
+     "website": "https://github.com/Fiveloss",
+     "x": "https://x.com/fivelossSH",
+     "telegram": "https://t.me/silverhandbuysTNbot"
+    }
+   },
+   "pairCurrencyAddress": "0x438820dcfe62a21e306614a4b54383cd8a36acf2",
+   "pairIsNative": false,
+   "pairSymbol": null,
+   "targetPairUnits": "3420101583196614730",
+   "taxBps": 100,
+   "weights": {
+    "cashBps": 0,
+    "holdersBps": 0,
+    "burnBps": 10000,
+    "holdersPairBps": 0
+   },
+   "projectTreasuryAddress": "0x3a20f86e6124f8ce0aa4a035299872bf2dcf42b8",
+   "initialProjectTreasuryAddress": "0x3a20f86e6124f8ce0aa4a035299872bf2dcf42b8",
+   "initialNetPersonalUnits": "0",
+   "gifts": {
+    "count": "0",
+    "root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "reservedUnits": "0",
+    "totalUnits": "0",
+    "deliveredCount": "0",
+    "deliveredUnits": "0",
+    "deliveredComplete": true,
+    "listId": null
+   },
+   "lifecycle": "CURVE_TRADING",
+   "graduated": false,
+   "graduation": null,
+   "curve": {
+    "tokensSoldGrossUnits": "403396372704950791162159423",
+    "pairReserveUnits": "693360653268157159",
+    "transfersUnlocked": false
+   },
+   "createdAt": "2026-10-19T09:48:26.000Z",
+   "createdBlock": "138647642",
+   "createdTransactionHash": "0x45866900cc9143057f42765ab5ffa7dc3833597b54ab72a45c57f82e7525965a",
+   "createdLogIndex": 21,
+   "asOfBlock": "138682832",
+   "asOfBlockHash": "0x784d274fafe8adfcccda659dd786a78e3a9c39c92235bef50362b2759c499d3b"
+  }
+ },
+ "v6_search": {
+  "items": [
+   {
+    "tokenAddress": "0x7ca1e72987d3c1bf347e8f13398c208a528ebed5",
+    "curveAddress": "0x3e4b77480a7a5206bbd30e997901263f506f9d56",
+    "launcherAddress": "0x3a20f86e6124f8ce0aa4a035299872bf2dcf42b8",
+    "factoryAddress": "0xe794217880011f9ca6961340ed5c16ec9559fea0",
+    "launchId": "16049",
+    "name": "Silverhand Buys",
+    "symbol": "SHBUYS",
+    "metadataURI": "ipfs://bafkreidygpkfqx32qznyviinegogygidhkri5fsaix3ij2zotvgxfqdeii",
+    "content": {
+     "description": "Demo token for Silverhand Buys, a Telegram buy bot for vibe/vibe launches on Robinhood Chain. Add @silverhandbuysTNbot to a group, /track a token, and every buy gets posted live with curve progress and new holders. Testnet only, no value.",
+     "image": {
+      "uri": "ipfs://bafkreicwr5vqkle4qspblzcj4g7ibmtxwc37ixiqe2ruqyovcikktzgp4m",
+      "mimeType": "image/webp",
+      "bytes": 86252,
+      "width": 640,
+      "height": 640,
+      "renders": {
+       "thumb": [
+        96,
+        96
+       ],
+       "sq410": [
+        410,
+        410
+       ],
+       "sq544": [
+        544,
+        544
+       ],
+       "card": [
+        640,
+        640
+       ]
+      }
+     },
+     "socials": {
+      "website": "https://github.com/Fiveloss",
+      "x": "https://x.com/fivelossSH",
+      "telegram": "https://t.me/silverhandbuysTNbot"
+     }
+    },
+    "pairCurrencyAddress": "0x438820dcfe62a21e306614a4b54383cd8a36acf2",
+    "pairIsNative": false,
+    "pairSymbol": null,
+    "targetPairUnits": "3420101583196614730",
+    "taxBps": 100,
+    "weights": {
+     "cashBps": 0,
+     "holdersBps": 0,
+     "burnBps": 10000,
+     "holdersPairBps": 0
+    },
+    "projectTreasuryAddress": "0x3a20f86e6124f8ce0aa4a035299872bf2dcf42b8",
+    "initialProjectTreasuryAddress": "0x3a20f86e6124f8ce0aa4a035299872bf2dcf42b8",
+    "initialNetPersonalUnits": "0",
+    "gifts": {
+     "count": "0",
+     "root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+     "reservedUnits": "0",
+     "totalUnits": "0",
+     "deliveredCount": "0",
+     "deliveredUnits": "0",
+     "deliveredComplete": true,
+     "listId": null
+    },
+    "lifecycle": "CURVE_TRADING",
+    "graduated": false,
+    "graduation": null,
+    "curve": {
+     "tokensSoldGrossUnits": "403396372704950791162159423",
+     "pairReserveUnits": "693360653268157159",
+     "transfersUnlocked": false
+    },
+    "createdAt": "2026-10-19T09:48:26.000Z",
+    "createdBlock": "138647642",
+    "createdTransactionHash": "0x45866900cc9143057f42765ab5ffa7dc3833597b54ab72a45c57f82e7525965a",
+    "createdLogIndex": 21,
+    "asOfBlock": "138682832",
+    "asOfBlockHash": "0x784d274fafe8adfcccda659dd786a78e3a9c39c92235bef50362b2759c499d3b",
+    "market": {
+     "complete": true,
+     "volume24hPairUnits": "693363713966175563",
+     "holderCount": 5,
+     "buyCount24h": 7,
+     "sellCount24h": 1,
+     "poolSqrtPriceX96": null,
+     "priceChange5mBps": 0,
+     "priceChange1hBps": 2195,
+     "priceChange6hBps": null,
+     "priceChange24hBps": null
+    }
+   }
+  ]
+ },
+ "curve_launch": {
+  "launchId": "141686",
+  "tokenAddress": "0xb25c234b87512dfac2b9ea6b10633bd709e2644a",
+  "curveAddress": "0xabd4fc291f3ef1c4395d1d2950b7db62544073e2",
+  "creatorAddress": "0x36ad798fab0732e6123aa065d3d803144a443871",
+  "creatorVaultAddress": "0x2edeb06299d6e517b4b3078633ac220c850785b6",
+  "quoteAssetAddress": "0x0000000000000000000000000000000000000000",
+  "name": "KYLE",
+  "symbol": "KYLE",
+  "decimals": 18,
+  "createdAt": "2026-09-29T00:42:22.000Z",
+  "metadata": {
+   "schemaVersion": 1,
+   "uri": "ipfs://bafkreiafyn6sh67dwi7dwnukyvxnha6hyfyjvrdhwk7dqbwe3qsyprmjfm",
+   "digest": "0x8b14c87bd7e0e03392d0981b35a563ccdc296a338cbf380600db8b7b2b83f2ae",
+   "integrity": "MATCHED"
+  },
+  "content": {
+   "description": "",
+   "image": {
+    "uri": "ipfs://bafkreih5lmwtaxoji5d4by6lmwunhj7nqj7ouwat2vbevbpt32xsl5t7ku",
+    "bytes": 27964,
+    "width": 400,
+    "height": 400,
+    "mimeType": "image/webp"
+   },
+   "socials": {
+    "x": "https://x.com/QuantTimeInMy"
+   }
+  },
+  "moderation": {
+   "visibility": "VISIBLE",
+   "reasonCode": null,
+   "publicNote": null,
+   "updatedAt": null
+  },
+  "curve": {
+   "lifecycle": "CURVE_TRADING",
+   "tokensSoldBaseUnits": "765412791837475690491341164",
+   "tokensRemainingBaseUnits": "27687208162524309508658836",
+   "netRaisedWei": "4391090608943071558",
+   "netTargetWei": "5000000000000000000",
+   "ethRemainingWei": "608909391056929867",
+   "quoteNetRaisedBaseUnits": null,
+   "quoteNetTargetBaseUnits": null,
+   "quoteRemainingBaseUnits": null,
+   "progressBps": 9650,
+   "completedAt": null,
+   "graduatedAt": null
+  },
+  "pool": null,
+  "analytics": {
+   "status": "AVAILABLE",
+   "reason": null,
+   "formulaVersion": "confirmed-principal-v1",
+   "lastPriceWeiPerToken": "20012491268",
+   "lastPriceQuoteBaseUnitsPerToken": null,
+   "volume5mWei": "142965973057223",
+   "volume1hWei": "2223141508736005",
+   "volume24hWei": "1358623664962604790",
+   "volume5mQuoteBaseUnits": null,
+   "volume1hQuoteBaseUnits": null,
+   "volume24hQuoteBaseUnits": null,
+   "priceChange5mBps": "67",
+   "priceChange1hBps": "67",
+   "priceChange24hBps": "497",
+   "priceChangeBasis": {
+    "m5": "WINDOW",
+    "h1": "WINDOW",
+    "h24": "WINDOW"
+   },
+   "uniqueBuyers1h": 45,
+   "buyCount1h": 45,
+   "sellCount1h": 13
+  },
+  "holderCount": 1118,
+  "asOfBlock": "138686538",
+  "asOfBlockHash": "0x17b80a3817ad82614a5bf0c5f0d95e7778770279b483fa111ece2fe9ed5861ae",
+  "freshness": {
+   "status": "FRESH",
+   "source": "INDEXER",
+   "chainId": 46630,
+   "asOfBlock": "138686566",
+   "asOfBlockHash": "0x1ddf7c2a38a7783eafeba6dd2539a092f5989ba5f940d5fc167fdb45854a2f0a",
+   "chainHeadBlock": "138686574",
+   "indexedThroughBlock": "138686566",
+   "lagBlocks": "8",
+   "coverageStartsAtBlock": "91563904",
+   "coverageComplete": true,
+   "observedAt": "2026-10-19T11:16:20.951Z",
+   "reason": null,
+   "headObservedBlock": "138686574",
+   "headObservedAt": "2026-10-19T11:16:20.982Z",
+   "headLagBlocks": "8"
+  }
+ },
+ "curve_candles": {
+  "interval": "1h",
+  "items": [
+   {
+    "bucketStart": "2026-10-18T11:00:00.000Z",
+    "tradeCount": 50,
+    "buyCount": 40,
+    "sellCount": 10
+   },
+   {
+    "bucketStart": "2026-10-18T12:00:00.000Z",
+    "tradeCount": 58,
+    "buyCount": 47,
+    "sellCount": 11
+   },
+   {
+    "bucketStart": "2026-10-18T13:00:00.000Z",
+    "tradeCount": 48,
+    "buyCount": 46,
+    "sellCount": 2
+   },
+   {
+    "bucketStart": "2026-10-18T14:00:00.000Z",
+    "tradeCount": 88,
+    "buyCount": 61,
+    "sellCount": 27
+   },
+   {
+    "bucketStart": "2026-10-18T15:00:00.000Z",
+    "tradeCount": 96,
+    "buyCount": 60,
+    "sellCount": 36
+   },
+   {
+    "bucketStart": "2026-10-18T16:00:00.000Z",
+    "tradeCount": 90,
+    "buyCount": 61,
+    "sellCount": 29
+   },
+   {
+    "bucketStart": "2026-10-18T17:00:00.000Z",
+    "tradeCount": 32,
+    "buyCount": 27,
+    "sellCount": 5
+   },
+   {
+    "bucketStart": "2026-10-18T20:00:00.000Z",
+    "tradeCount": 1,
+    "buyCount": 1,
+    "sellCount": 0
+   },
+   {
+    "bucketStart": "2026-10-18T21:00:00.000Z",
+    "tradeCount": 1,
+    "buyCount": 0,
+    "sellCount": 1
+   },
+   {
+    "bucketStart": "2026-10-18T22:00:00.000Z",
+    "tradeCount": 1,
+    "buyCount": 0,
+    "sellCount": 1
+   },
+   {
+    "bucketStart": "2026-10-18T23:00:00.000Z",
+    "tradeCount": 2,
+    "buyCount": 0,
+    "sellCount": 2
+   },
+   {
+    "bucketStart": "2026-10-19T01:00:00.000Z",
+    "tradeCount": 2,
+    "buyCount": 1,
+    "sellCount": 1
+   },
+   {
+    "bucketStart": "2026-10-19T02:00:00.000Z",
+    "tradeCount": 1,
+    "buyCount": 1,
+    "sellCount": 0
+   },
+   {
+    "bucketStart": "2026-10-19T03:00:00.000Z",
+    "tradeCount": 2,
+    "buyCount": 2,
+    "sellCount": 0
+   },
+   {
+    "bucketStart": "2026-10-19T04:00:00.000Z",
+    "tradeCount": 1,
+    "buyCount": 0,
+    "sellCount": 1
+   },
+   {
+    "bucketStart": "2026-10-19T06:00:00.000Z",
+    "tradeCount": 2,
+    "buyCount": 0,
+    "sellCount": 2
+   },
+   {
+    "bucketStart": "2026-10-19T07:00:00.000Z",
+    "tradeCount": 45,
+    "buyCount": 33,
+    "sellCount": 12
+   },
+   {
+    "bucketStart": "2026-10-19T08:00:00.000Z",
+    "tradeCount": 57,
+    "buyCount": 39,
+    "sellCount": 18
+   },
+   {
+    "bucketStart": "2026-10-19T09:00:00.000Z",
+    "tradeCount": 59,
+    "buyCount": 43,
+    "sellCount": 16
+   },
+   {
+    "bucketStart": "2026-10-19T10:00:00.000Z",
+    "tradeCount": 55,
+    "buyCount": 40,
+    "sellCount": 15
+   },
+   {
+    "bucketStart": "2026-10-19T11:00:00.000Z",
+    "tradeCount": 14,
+    "buyCount": 13,
+    "sellCount": 1
+   }
+  ]
+ }
+}

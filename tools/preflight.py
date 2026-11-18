@@ -405,14 +405,32 @@ async def check_telegram(session):
         fail(f"bot token rejected: {body.get('description')}")
 
 
+async def check_vibe(rpc):
+    """Testnet: the vibe/vibe contracts the bot reads are there (the quotes and stock feeds
+    above are mainnet's and do not exist on testnet)."""
+    for c in chain.vibe_contracts(chain.TESTNET_CHAIN_ID):
+        for name, addr in (("factory", c.factory), ("pool hook", c.hook), ("router", c.router)):
+            if not addr:
+                continue  # buyers call this factory's curves themselves
+            code = await rpc.call("eth_getCode", [addr, "latest"])
+            if code and code != "0x":
+                ok(f"vibe/vibe {c.gen} {name} at {addr}")
+            else:
+                fail(f"no contract at the vibe/vibe {c.gen} {name} {addr}")
+
+
 async def live_checks(rpc, url, chain_id, head):
-    if chain_id != chain.CHAIN_ID:
+    if chain_id == chain.TESTNET_CHAIN_ID:
+        ok(f"RPC {url}: Robinhood Chain testnet ({chain_id}), block {head}")
+        steps = ((check_vibe, (rpc,)),)
+    elif chain_id != chain.CHAIN_ID:
         fail(f"RPC is chain {chain_id}, not Robinhood Chain {chain.CHAIN_ID}")
         return
-    ok(f"RPC {url}: chain {chain_id}, block {head}")
+    else:
+        ok(f"RPC {url}: chain {chain_id}, block {head}")
+        steps = ((check_quotes, (rpc,)), (check_stock_feeds, (rpc,)))
     unanswered = []
-    steps = ((check_quotes, (rpc,)), (check_stock_feeds, (rpc,)))
-    if "--full" in sys.argv:
+    if "--full" in sys.argv and chain_id == chain.CHAIN_ID:
         steps = ((check_launch_and_curve, (rpc, head)), (check_curve_model, (rpc, head)),
                  (check_sell_model, (rpc, head)), (check_graduation_and_pool, (rpc, head)),
                  (check_v3_v2_pools, (rpc, head)), (check_v4_pools, (rpc, head)),
@@ -448,6 +466,11 @@ async def main():
         rpc = Rpc(url, session, min_interval=1.2)
         try:
             chain_id = int(await rpc.call("eth_chainId", []), 16)
+            expected = int(os.environ.get("CHAIN_ID", "46630" if url.rstrip("/") ==
+                                          "https://rpc.testnet.chain.robinhood.com" else "4663"))
+            if chain_id != expected:
+                fail(f"RPC is chain {chain_id}, configured CHAIN_ID is {expected}")
+                return
             head = await rpc.block_number()
         except RpcError as e:
             if "Cloudflare" not in e.message:

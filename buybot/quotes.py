@@ -25,6 +25,14 @@ NATIVE = abi.ZERO_ADDRESS
 WETH = "0x0bd7d308f8e1639fab988df18a8011f41eacad73"
 USDG = "0x5fc5360d0400a0fd4f2af552add042d716f1d168"
 
+# A testnet stock token (vibe/vibe's test AAPL and the like) has no feed. It is valued by
+# its Uniswap v4 pool against ETH: the one vibe/vibe's router swaps the buyer's ETH through
+# (ETH, the token, 0.3%, tick spacing 60, no hook), whose price the vibe/vibe site uses too.
+# Kind "ethpool:<token>:<pool id>"; a pool thinner than ETH_POOL_MIN_DEPTH gives no dollars.
+ETH_POOL_FEE, ETH_POOL_SPACING = 3000, 60
+ETH_POOL_MIN_DEPTH = 10 ** 18   # wei on the ETH side around the price
+APPROX_KINDS = ("ethpool:",)    # dollars from a pool price, not a feed: shown as approximate
+
 SEL_LATEST_ROUND = "0xfeaf968c"  # latestRoundData() on a Chainlink feed
 FEED_DECIMALS = 8                 # every USD feed on the list; preflight checks it
 FEED_MAX_AGE = 4 * 86400
@@ -94,8 +102,11 @@ def decode_round(ret_hex: str) -> tuple[float, int] | None:
 
 
 class Rates:
-    """Dollars per unit of each quote kind: "eth", "usd", "feed:<address>".
-    "other" (a quote not on the list) has no rate. Feed reads are cached for `ttl`."""
+    """Dollars per unit of each quote kind: "eth", "usd", "feed:<address>",
+    "vibe:<curve>:<pool>" (a vibe/vibe token quoted in ETH, valued by its curve or its
+    v4 pool: vibe.eth_price) and "ethpool:<token>:<pool>" (a testnet stock token, valued
+    by its v4 pool against ETH: pools.eth_pool_price). "other" (a quote not on the list)
+    has no rate. Reads are cached for `ttl`."""
 
     def __init__(self, rpc, eth_usd, ttl: float = 60.0, max_age: float = FEED_MAX_AGE):
         self.rpc = rpc
@@ -103,6 +114,7 @@ class Rates:
         self.ttl = ttl
         self.max_age = max_age
         self._feeds: dict[str, tuple[float, float, int]] = {}  # feed -> (usd, read at, updatedAt)
+        self._vibe: dict[str, tuple[float, float]] = {}  # vibe:/ethpool: kind -> (ETH per token, read at)
 
     def current(self, kind: str) -> float | None:
         """The last known rate, without touching the network."""
@@ -114,6 +126,11 @@ class Rates:
             hit = self._feeds.get(kind[5:])
             if hit and time.time() - hit[2] <= self.max_age:
                 return hit[0]
+        if kind.startswith(("vibe:", "ethpool:")):
+            hit = self._vibe.get(kind)
+            eth = self.eth_usd.current
+            if hit and eth and time.time() - hit[1] <= 10 * self.ttl:
+                return hit[0] * eth
         return None
 
     async def get(self, kind: str) -> float | None:
@@ -121,6 +138,21 @@ class Rates:
             return 1.0
         if kind == "eth":
             return await self.eth_usd.get()
+        if kind.startswith(("vibe:", "ethpool:")):
+            await self.eth_usd.get()
+            hit = self._vibe.get(kind)
+            if hit is None or time.time() - hit[1] > self.ttl:
+                from . import pools, vibe  # vibe -> pools -> quotes
+                what, address, pool = kind.split(":")
+                try:
+                    price = await (vibe.eth_price(self.rpc, address, pool) if what == "vibe"
+                                   else pools.eth_pool_price(self.rpc, address, pool))
+                except Exception as e:
+                    log.info("%s quote %s unreadable: %s", what, address, e)
+                    price = None
+                if price:
+                    self._vibe[kind] = (price, time.time())
+            return self.current(kind)
         if not kind.startswith("feed:"):
             return None
         feed = kind[5:]

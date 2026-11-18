@@ -207,6 +207,14 @@ def compact_formatter(final: float, prefix="$", suffix=""):
     return lambda v, dec=dec: f"{prefix}{v:.{dec}f}{suffix}"
 
 
+def _level_text(v: float) -> str:
+    """A round market cap level as a milestone shows it: $25K, $2.5M (no trailing .0)."""
+    for div, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if v >= div:
+            return "$" + f"{v / div:.1f}".rstrip("0").rstrip(".") + suffix
+    return f"${v:,.0f}"
+
+
 def int_formatter(final):
     return lambda v: _grp(round(v))
 
@@ -948,7 +956,14 @@ class Card:
         self.items = []
         # --- pills: side + badges
         pills = [("BUY" if self.side > 0 else "SELL", self.sc, True)]
-        if sp.get("whale"):
+        # a milestone (market cap passing a round level, the curve 50/75/90% sold, the
+        # holders passing 50/100/250…) takes
+        # the same card: its own pill, the level as the hero
+        ms = sp.get("milestone")
+        if ms:
+            pills = [({"mc": "NEW HIGH", "grad": "GRADUATED", "holders": "HOLDERS"}.get(ms["what"], "CURVE"),
+                      pal["grad"], True)]
+        elif sp.get("whale"):
             pills.append(("WHALE", pal["accent"] if self.side > 0 else self.sc, False))
         if sp.get("dev"):
             pills.append(("DEV", pal["warn"], False))
@@ -963,9 +978,24 @@ class Card:
         qs = sp.get("quote_symbol") or ""
         self.hero = None
         L, R = self.panel_box[0] + 24, self.panel_box[2] - 24
-        if usd is not None:
+        # dollars from a pool price (testnet stock tokens) are approximate: "~" (the hero
+        # font has no "≈")
+        approx = "~" if sp.get("usd_approx") else ""
+        if ms:
+            if ms["what"] == "grad":  # what the curve raised: dollars when known, else its quote
+                lvl = ms["level"] or 0.0
+                if usd is not None:
+                    self.hero = (lvl, (lambda v, f=compact_formatter(lvl): approx + f(v)))
+                else:
+                    self.hero = (lvl, compact_formatter(lvl, prefix="", suffix=f" {qs}"))
+            elif ms["what"] == "holders":
+                self.hero = (float(ms["level"]), lambda v: f"{v:,.0f}")
+            else:
+                lvl = ms["level"] if ms["what"] == "mc" else ms["level"] * 100
+                self.hero = (lvl, _level_text if ms["what"] == "mc" else (lambda v: f"{v:.0f}%"))
+        elif usd is not None:
             fmt = money_formatter(usd)
-            self.hero = (usd, fmt)
+            self.hero = (usd, (lambda v, f=fmt: approx + f(v)) if approx else fmt)
         elif q is not None:
             f = compact_formatter(q, prefix="", suffix=f" {qs}") if q >= 10000 else \
                 (lambda v, d=(2 if q >= 1 else 4): f"{v:.{d}f} {qs}")
@@ -993,11 +1023,16 @@ class Card:
             parts.append(f"{qty(q)} {qs}")
         if sp.get("tokens") is not None:
             parts.append(f"{compact(sp['tokens'])} ${(sp.get('symbol') or '').lstrip('$')}")
+        if ms:
+            parts = [{"mc": "MARKET CAP", "holders": "HOLDERS",
+                      "grad": f"RAISED · NOW ON {(sp.get('venue') or 'UNISWAP V4').upper()}"}
+                     .get(ms["what"], "OF THE CURVE SOLD")]
         self.sub = parts
         # --- MC
         self.mc = None
         if sp.get("mc_usd") is not None:
-            self.mc = (sp["mc_usd"], compact_formatter(sp["mc_usd"]))
+            fmt = compact_formatter(sp["mc_usd"])
+            self.mc = (sp["mc_usd"], (lambda v, f=fmt: approx + f(v)) if approx else fmt)
         elif sp.get("mc_quote") is not None:
             self.mc = (sp["mc_quote"], compact_formatter(sp["mc_quote"], prefix="", suffix=f" {qs}"))
         if self.mc:
@@ -1622,11 +1657,25 @@ def render_card(spec: dict, fps: int = 60, size=SIZE, seconds: float = 4.8, crf:
         err = []
         th = threading.Thread(target=lambda: err.append(proc.stderr.read()), daemon=True)
         th.start()
-        for i in range(n):
-            proc.stdin.write(card.frame(i / fps).tobytes())
-        proc.stdin.close()
-        rc = proc.wait(timeout=120)
-        th.join(5)
+        try:
+            for i in range(n):
+                im = card.frame(i / fps)
+                try:
+                    proc.stdin.write(im.tobytes())
+                finally:
+                    im.close()
+            proc.stdin.close()
+            rc = proc.wait(timeout=120)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+            th.join(5)
+            proc.stderr.close()
         if rc != 0:
             raise RuntimeError((err[0] if err else b"").decode(errors="replace")[-500:])
         data = Path(path).read_bytes()

@@ -27,10 +27,10 @@ from aiogram.enums import ChatMemberStatus, ChatType
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import (JOIN_TRANSITION, LEAVE_TRANSITION, ChatMemberUpdatedFilter, Command,
                              CommandObject, CommandStart)
-from aiogram.types import (CallbackQuery, ChatMemberUpdated, FSInputFile, InlineKeyboardButton,
-                           InlineKeyboardMarkup, InputMediaAnimation, Message, User)
+from aiogram.types import (BufferedInputFile, CallbackQuery, ChatMemberUpdated, FSInputFile, InlineKeyboardButton,
+                           InlineKeyboardMarkup, InputMediaAnimation, InputMediaVideo, Message, User)
 
-from . import abi, emoji, heavy, i18n, render
+from . import __version__, abi, emoji, health, heavy, i18n, promo, render
 from . import scan as scanner
 from .config import Config
 from .db import Chat, Db
@@ -44,6 +44,8 @@ log = logging.getLogger(__name__)
 
 GROUPS = {ChatType.GROUP, ChatType.SUPERGROUP}
 MENU_DIR = Path(__file__).resolve().parent.parent / "assets" / "menu"
+PROMO_PREVIEW = Path(__file__).resolve().parent.parent / "assets" / "brand" / "promo-styles.jpg"
+PROMO_SAMPLES = Path(__file__).resolve().parent.parent / "assets" / "promo-styles"  # <style>.mp4
 CAPTION_MAX = 1024
 ADMINS = (ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR)
 SUPPORT_COOLDOWN = 600  # seconds between two /support messages of one person
@@ -67,6 +69,8 @@ class App:
     scans: dict = field(default_factory=dict)       # token -> its last scan.Scan, kept SCAN_TTL
     scanning: set = field(default_factory=set)      # tokens being scanned right now
     scan_at: dict = field(default_factory=dict)     # user id -> time of their last fresh /scan
+    promos: promo.Promos = field(default_factory=promo.Promos)  # /promo: its queue, cache and limits
+    hooks: dict = field(default_factory=dict)       # build_router's actions, panel and promo, for the Mini App
 
     def __post_init__(self):
         if self.rates is None:
@@ -201,7 +205,11 @@ def settings_text(app: App, chat_id: int, lang: str) -> str:
         w = app.watcher
         if w is not None:
             age = time.time() - w.last_ok
-            lines.append(t(lang, "set_live", s=int(age)) if age < 120 else t(lang, "set_stale", m=int(age // 60)))
+            problems = health.issues(app, chat_id=chat_id)
+            if problems:
+                lines += [t(lang, "health_issue_" + p) for p in sorted(problems)]
+            else:
+                lines.append(t(lang, "set_live", s=int(age)) if age < 120 else t(lang, "set_stale", m=int(age // 60)))
     else:
         lines.append(t(lang, "set_no_token"))
     if chat.thread_id:
@@ -211,6 +219,8 @@ def settings_text(app: App, chat_id: int, lang: str) -> str:
     if chat.whale_usd:
         lines.append(t(lang, "set_whale", v=render.fmt_usd(chat.whale_usd)))
     lines.append(t(lang, "set_sells_on" if chat.sells else "set_sells_off"))
+    lines.append(t(lang, "set_digest_on" if chat.digest else "set_digest_off"))
+    lines.append(t(lang, "set_alerts_on" if chat.alerts else "set_alerts_off"))
     lines.append(t(lang, {0: "set_chart_off", 2: "set_chart_still"}.get(chat.chart, "set_chart_on")))
     lines.append(t(lang, "set_lang", lang=i18n.LANG_NAMES[i18n.norm(chat.lang)]))
     lines.append(t(lang, "set_media", m=chat.media_kind or t(lang, "media_none")))
@@ -251,6 +261,15 @@ async def stats_text(app: App, chat: Chat, lang: str) -> str:
             lines.append(t(lang, "stats_change", v=f"{'▲' if day.change >= 0 else '▼'} {abs(day.change) * 100:.1f}%"))
         if day.biggest_buy:
             lines.append(t(lang, "stats_whale", v=money(day.biggest_buy)))
+        # the week, from the trades kept (8 days); only when it covers more than the day
+        week = token_day(app.db.trades_since(token.address, int(now - 7 * 86400)), supply, now,
+                         window=7 * 86400)
+        if week is not None and week.hours > day.hours + 1:
+            lines += ["", t(lang, "stats_week", d=max(1, round(week.hours / 24)))]
+            lines.append(t(lang, "stats_week_flow", buys=week.buys, sells=week.sells,
+                           bv=money(week.buy_volume), sv=money(week.sell_volume)))
+            change = "" if week.change is None else f" · {'▲' if week.change >= 0 else '▼'} {abs(week.change) * 100:.1f}%"
+            lines.append(t(lang, "stats_week_mc", hi=cap(week.mc_high), lo=cap(week.mc_low), change=change))
     posted = app.db.chat_posted(chat.chat_id)
     lines += ["", t(lang, "stats_posted", d=posted["today"], w=posted["week"], a=posted["all"])]
     if rate and token.quote_kind != "usd":
@@ -471,6 +490,22 @@ def build_router(app: App) -> Router:
         app.db.update_chat(chat_id, sells=int(value == "on"))
         return t(lang, "sells_on" if value == "on" else "sells_off"), None
 
+    async def act_digest(bot, chat_id, args, reply_to, lang):
+        value = _switch(args)
+        if value is None:
+            state = t(lang, "on" if app.db.get_chat(chat_id).digest else "off")
+            return t(lang, "digest_state", state=state), None
+        app.db.update_chat(chat_id, digest=int(value == "on"))
+        return t(lang, "digest_on" if value == "on" else "digest_off"), None
+
+    async def act_alerts(bot, chat_id, args, reply_to, lang):
+        value = _switch(args)
+        if value is None:
+            state = t(lang, "on" if app.db.get_chat(chat_id).alerts else "off")
+            return t(lang, "alerts_state", state=state), None
+        app.db.update_chat(chat_id, alerts=int(value == "on"))
+        return t(lang, "alerts_on" if value == "on" else "alerts_off"), None
+
     async def act_chart(bot, chat_id, args, reply_to, lang):
         modes = {"on": CHART_ANIMATED, "anim": CHART_ANIMATED, "still": CHART_STILL, "off": CHART_OFF}
         value = args[0].lower() if args else ""
@@ -540,7 +575,7 @@ def build_router(app: App) -> Router:
         return await scan_answer(app, address, lang), None
 
     actions = {"track": act_track, "untrack": act_untrack, "minbuy": act_minbuy,
-               "emoji": act_emoji, "whale": act_whale, "media": act_media, "sells": act_sells,
+               "emoji": act_emoji, "whale": act_whale, "media": act_media, "sells": act_sells, "digest": act_digest, "alerts": act_alerts,
                "chart": act_chart, "lang": act_lang, "stats": act_stats, "top": act_top,
                "settings": act_settings, "test": act_test, "help": act_help, "scan": act_scan}
 
@@ -602,6 +637,173 @@ def build_router(app: App) -> Router:
             bot, message.chat.id, (command.args or "").split(), message.reply_to_message, chat.lang)
         if text:
             await message.reply(text, reply_markup=markup)
+
+    # ---- /promo: a short video of a vibe/vibe launch, for its creator's X. Anyone in the
+    # private chat; in a group, its admins (the video lands in the group).
+    async def promo_facts(address: str):
+        """(spec, logo) of a launch: kept for a couple of minutes, else read now."""
+        if app.cfg.chain_id != promo.CHAIN_ID:
+            raise promo.PromoError("promo_testnet_only")
+        got = app.promos.cached_facts(address)
+        if got is None:
+            chain_id = await app.rpc.chain_id() if hasattr(app.rpc, "chain_id") else None
+            got = await promo.gather(app.rpc, getattr(app.rpc, "session", None), app.rates, address,
+                                     token=app.db.get_token(address), bot="@" + app.username,
+                                     network="Robinhood Chain" if chain_id == 4663 else "Robinhood Chain testnet",
+                                     testnet=chain_id != 4663)
+            app.promos.keep_facts(address, *got)
+        return got
+
+    async def promo_reply(message: Message, bot: Bot, args: list[str], lang: str, default: str | None):
+        """/promo 0x… [style]: with a style, the video; without one, the style picker."""
+        if app.cfg.chain_id != promo.CHAIN_ID:
+            await message.reply(t(lang, "promo_testnet_only"))
+            return
+        address = args[0].lower() if args and abi.is_address(args[0]) else (default if not args else None)
+        if not address:
+            await message.reply(t(lang, "promo_usage"))
+            return
+        style = args[1].lower() if len(args) > 1 else None
+        thread = message.message_thread_id if message.is_topic_message else None
+        user_id = message.from_user.id if message.from_user else 0
+        if style not in promo.STYLES:
+            await promo_picker(bot, message, address, user_id, lang, thread)
+            return
+        await promo_make(bot, message.chat.id, message.chat.type, thread, user_id, lang, address, style,
+                         reply_to=message.message_id)
+
+    async def promo_picker(bot: Bot, message: Message, address: str, user_id: int, lang: str, thread):
+        """What each style looks like, then a button per style; only whoever asked can pick.
+        The looks: an album of six short sample clips (assets/promo-styles), numbered as the
+        buttons are; without the clips, one picture of them all."""
+        rows, row = [], []
+        for i, name in enumerate(promo.STYLES):
+            row.append(cb_btn(f"{i + 1} · {promo.STYLE_NAMES[name]}", f"pr:{name}"))
+            if len(row) == 3:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        caption = t(lang, "promo_pick", token=f"{address[:6]}…{address[-4:]}")
+        reply_to = message.message_id
+        shown = False
+        if all((PROMO_SAMPLES / f"{n}.mp4").exists() or n in app.promos.samples for n in promo.STYLES):
+            media = [InputMediaVideo(media=app.promos.samples.get(n) or FSInputFile(PROMO_SAMPLES / f"{n}.mp4"),
+                                     caption=f"{i + 1} · {promo.STYLE_NAMES[n]}", width=432, height=540,
+                                     supports_streaming=True)
+                     for i, n in enumerate(promo.STYLES)]
+            try:
+                album = await bot.send_media_group(message.chat.id, media, message_thread_id=thread,
+                                                   reply_to_message_id=reply_to)
+                for n, m in zip(promo.STYLES, album):
+                    if m.video:
+                        app.promos.samples[n] = m.video.file_id
+                reply_to, shown = album[0].message_id, True
+            except TelegramAPIError as e:
+                log.warning("promo samples not sent: %s", e)
+        try:
+            if shown:
+                sent = await bot.send_message(message.chat.id, caption, reply_markup=kb(*rows),
+                                              message_thread_id=thread, reply_to_message_id=reply_to)
+            else:
+                sent = await bot.send_photo(message.chat.id, app.promos.preview or FSInputFile(PROMO_PREVIEW),
+                                            caption=caption, reply_markup=kb(*rows), message_thread_id=thread,
+                                            reply_to_message_id=reply_to)
+                if sent.photo:
+                    app.promos.preview = sent.photo[-1].file_id
+        except TelegramAPIError as e:
+            log.warning("promo picker not sent: %s", e)
+            return
+        app.promos.keep_picker(message.chat.id, sent.message_id, address, user_id, lang)
+
+    async def promo_make(bot: Bot, chat_id: int, chat_type, thread, user_id: int, lang: str, address: str,
+                         style: str, reply_to: int | None = None):
+        if app.cfg.chain_id != promo.CHAIN_ID:
+            await bot.send_message(chat_id, t(lang, "promo_testnet_only"),
+                                   message_thread_id=thread, reply_to_message_id=reply_to)
+            return
+        if not is_owner(app, user_id):
+            wait = app.promos.users.allow(user_id)
+            if not wait and chat_type != ChatType.PRIVATE:
+                wait = app.promos.chats.allow(chat_id)
+            if wait:
+                await bot.send_message(chat_id, t(lang, "promo_wait", wait=promo.wait_text(wait, lang)),
+                                       message_thread_id=thread, reply_to_message_id=reply_to)
+                return
+        # an answer at once: reading a launch the bot does not track takes a while
+        note = await bot.send_message(chat_id, t(lang, "promo_making", style=promo.STYLE_NAMES[style]),
+                                      message_thread_id=thread, reply_to_message_id=reply_to)
+
+        async def say(key: str, **kw):  # the note becomes the answer
+            try:
+                await bot.edit_message_text(t(lang, key, **kw), chat_id=chat_id, message_id=note.message_id)
+            except TelegramAPIError:
+                pass
+
+        try:
+            spec, logo = await promo_facts(address)
+        except promo.PromoError as e:
+            await say(e.key, **e.kw)
+            return
+        except Exception:
+            log.exception("promo facts of %s failed", address)
+            await say("promo_failed")
+            return
+        key = promo.cache_key(spec, logo, style)
+        text = promo.caption(spec, lang)
+        sent = None
+        file_id = app.promos.cached_video(key)
+        if file_id:  # the same facts drawn in this style not long ago: the same video
+            try:
+                sent = await bot.send_video(chat_id, file_id, caption=text, message_thread_id=thread)
+            except TelegramAPIError as e:
+                log.info("cached promo of %s not sent: %s", address, e)
+        if sent is None:
+            try:
+                data = await app.promos.render(spec, logo, style)
+                from .promo_video import SECONDS, SIZE
+                name = (re.sub(r"[^A-Za-z0-9]", "", spec["symbol"]) or "token") + f"-{style}.mp4"
+                sent = await bot.send_video(chat_id, BufferedInputFile(data, name), caption=text,
+                                            width=SIZE[0], height=SIZE[1], duration=round(SECONDS),
+                                            supports_streaming=True, message_thread_id=thread)
+                if sent.video:
+                    app.promos.keep_video(key, sent.video.file_id)
+            except promo.PromoError as e:  # too many waiting
+                await say(e.key, **e.kw)
+                return
+            except Exception:
+                log.exception("promo video of %s failed", address)
+                await say("promo_render_failed")
+                return
+        try:
+            await bot.delete_message(chat_id, note.message_id)
+        except TelegramAPIError:
+            pass
+
+    @router.message(Command("promo"), F.chat.type.in_(GROUPS))
+    async def promo_group(message: Message, bot: Bot, command: CommandObject):
+        if not await is_admin(message, bot):
+            return
+        chat = seen(message)
+        await promo_reply(message, bot, (command.args or "").split(), chat.lang, chat.token)
+
+    @router.callback_query(F.data.startswith("pr:"))
+    async def promo_pick(cb: CallbackQuery, bot: Bot):
+        """A style picked under the picker: the video in it, for whoever asked."""
+        style = cb.data[3:]
+        msg = cb.message
+        got = app.promos.picker(msg.chat.id, msg.message_id) if msg else None
+        lang = user_lang(app, cb.from_user)
+        if got is None or style not in promo.STYLES:
+            await cb.answer(t(lang, "promo_pick_old"), show_alert=True)
+            return
+        address, user_id, lang = got
+        if cb.from_user.id != user_id:
+            await cb.answer(t(lang, "promo_pick_owner"), show_alert=True)
+            return
+        await cb.answer(promo.STYLE_NAMES[style])
+        thread = msg.message_thread_id if msg.is_topic_message else None
+        await promo_make(bot, msg.chat.id, msg.chat.type, thread, user_id, lang, address, style)
 
     # ---- commands posted in a channel: only its admins can post there. The answer goes
     # out silently and is removed together with the command after app.note_ttl seconds,
@@ -715,15 +917,29 @@ def build_router(app: App) -> Router:
         if animation and animation.file_id:
             app.db.set_meta(cache, animation.file_id)
 
+    def forget(media) -> bool:
+        """A cached file_id Telegram refused (one from another bot, after a token change):
+        drop it, so the next try uploads the file. True when there was one."""
+        if isinstance(media[0], str):
+            app.db.delete_meta(media[1])
+            return True
+        return False
+
     async def send_screen(bot: Bot, chat_id: int, lang: str, key: str, text: str, markup=None):
         media = anim(lang, key) if plain_len(text) <= CAPTION_MAX else None
-        if media:
+        for _ in range(2):  # the cached file_id, then the file itself if Telegram refused it
+            if not media:
+                break
             try:
                 msg = await bot.send_animation(chat_id, media[0], caption=text, reply_markup=markup)
                 remember(media[1], msg)
                 return msg
+            except TelegramBadRequest as e:
+                log.warning("screen %s: animation refused (%s)", key, e)
+                media = anim(lang, key) if forget(media) else None
             except TelegramAPIError as e:
                 log.warning("screen %s without animation: %s", key, e)
+                break
         return await bot.send_message(chat_id, text, reply_markup=markup)
 
     async def edit_screen(cb: CallbackQuery, lang: str, key: str, text: str, markup=None):
@@ -751,7 +967,8 @@ def build_router(app: App) -> Router:
                    url_btn(t(lang, "btn_add_channel"),
                            f"https://t.me/{app.username}?startchannel=true&admin=post_messages")],
                   [cb_btn(t(lang, "btn_chats"), "m:chats"), cb_btn(t(lang, "btn_stats"), "m:stats")],
-                  [cb_btn(t(lang, "btn_help"), "m:help"), cb_btn(t(lang, "btn_lang"), "m:lang")],
+                  [cb_btn(t(lang, "btn_help"), "m:help")]
+                  + [cb_btn(t(lang, "btn_lang"), "m:lang")] * (len(i18n.LANGS) > 1),
                   [cb_btn(t(lang, "btn_terms"), "m:terms"), cb_btn(t(lang, "btn_support"), "m:support")])
 
     def back(lang: str) -> list[InlineKeyboardButton]:
@@ -797,8 +1014,8 @@ def build_router(app: App) -> Router:
                  cb_btn(t(lang, "btn_top"), f"c:top:{cid}"), cb_btn(t(lang, "btn_scan"), f"c:scan:{cid}")],
                 [cb_btn(t(lang, "btn_sells", state=t(lang, "off" if chat.sells else "on")), f"c:sells:{cid}"),
                  cb_btn(t(lang, "btn_chart", state=t(lang, "off" if chat.chart else "on")), f"c:chart:{cid}")],
-                [cb_btn(t(lang, "btn_chat_lang", lang=i18n.LANG_NAMES[other]), f"c:lang:{cid}"),
-                 cb_btn(t(lang, "btn_refresh"), f"m:chat:{cid}")],
+                [cb_btn(t(lang, "btn_chat_lang", lang=i18n.LANG_NAMES[other]), f"c:lang:{cid}")]
+                * (other in i18n.LANGS) + [cb_btn(t(lang, "btn_refresh"), f"m:chat:{cid}")],
                 [cb_btn(t(lang, "back_chats"), "m:chats")])
         if name == "stats":
             cid = int(arg) if arg else app.db.dm_chat(user.id)
@@ -922,7 +1139,7 @@ def build_router(app: App) -> Router:
 
     @router.message(CommandStart(), private)
     async def start(message: Message, bot: Bot):
-        if app.db.user_lang(message.from_user.id) is None:
+        if app.db.user_lang(message.from_user.id) is None and len(i18n.LANGS) > 1:
             # first visit: the language first, in both languages at once
             await send_screen(bot, message.chat.id, user_lang(app, message.from_user), "lang",
                               t("en", "lang_pick"), lang_markup())
@@ -937,7 +1154,7 @@ def build_router(app: App) -> Router:
             await message.answer(t(code, "lang_set"))
             await show(message, bot, "home")
             return
-        await show(message, bot, "lang")
+        await show(message, bot, "lang" if len(i18n.LANGS) > 1 else "home")
 
     @router.message(Command("chats"), private)
     async def chats_command(message: Message, bot: Bot):
@@ -998,6 +1215,14 @@ def build_router(app: App) -> Router:
                 return
             app.scan_at[message.from_user.id] = time.time()
         await message.answer(await scan_answer(app, address, lang))
+
+    @router.message(Command("promo"), private)
+    async def promo_private(message: Message, bot: Bot, command: CommandObject):
+        """/promo 0x… for anyone, or /promo alone for the current chat's token."""
+        cid = app.db.dm_chat(message.from_user.id)
+        current = app.db.get_chat(cid) if cid else None
+        await promo_reply(message, bot, (command.args or "").split(), user_lang(app, message.from_user),
+                          current.token if current and current.active else None)
 
     # Group commands sent here apply to this person's current chat
     # (/help, /lang and /scan have their own answers above).
@@ -1084,6 +1309,7 @@ def build_router(app: App) -> Router:
             watcher=watcher)
         text += "\n" + t(lang, "adm_health", mb=process_mb(), up=round((time.time() - app.started) / 3600, 1),
                           backup=last_backup(app) or "—")
+        text += "\n" + health.report(app, lang)
         return text, kb([cb_btn(t(lang, "adm_btn_chats"), "a:chats:0")],
                         [cb_btn(t(lang, "btn_refresh"), "a:home"), cb_btn(t(lang, "back"), "m:home")])
 
@@ -1128,7 +1354,7 @@ def build_router(app: App) -> Router:
         last = app.db.last_block()
         lag = (w.head - last) if w and w.head and last else None
         eth = app.eth_usd.current
-        lines = [f"<b>Bot stats</b> (up {int((time.time() - app.started) / 3600)} h)"]
+        lines = [f"<b>Bot stats</b> {__version__} (up {int((time.time() - app.started) / 3600)} h)"]
         lines += [f"{k}: {v}" for k, v in s.items()]
         langs = app.db.users_by_lang()
         lines.append("users by language: " + (", ".join(f"{k} {v}" for k, v in sorted(langs.items())) or "none"))
@@ -1138,6 +1364,7 @@ def build_router(app: App) -> Router:
                          + (f" · error: {escape(w.last_error)}" if w.last_error else ""))
         if snd:
             lines.append(f"sent: {snd.sent} · dropped: {snd.dropped}")
+        lines.append(health.report(app, user_lang(app, message.from_user)))
         lines.append(f"rpc calls: {getattr(rpc, 'calls', '?')} · errors: {getattr(rpc, 'errors', '?')}")
         lines.append(f"ETH: {render.fmt_usd(eth) if eth else 'unknown'}")
         await message.answer("\n".join(lines))
@@ -1148,4 +1375,6 @@ def build_router(app: App) -> Router:
     async def stale_button(cb: CallbackQuery):
         await cb.answer()
 
+    # the Mini App (webapp.py) runs the same code as the commands
+    app.hooks.update(actions=actions, panel=panel, promo_make=promo_make, spawn=spawn)
     return router

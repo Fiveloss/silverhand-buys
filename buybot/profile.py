@@ -11,18 +11,20 @@ SHORT_DESCRIPTION_MAX = 120
 
 # Key None is the default for every language without its own text.
 DESCRIPTIONS = {
-    None: (
-        "⚡ Every buy of your token, posted in your chat the moment it lands on Robinhood Chain.\n"
+    None: (  # this branch is the testnet bot: vibe/vibe launches on Robinhood Chain testnet
+        "⚡ Every buy of your vibe/vibe launch, posted in your chat the moment it lands on "
+        "Robinhood Chain testnet.\n"
         "\n"
         "💵 Amount, buyer and market cap\n"
-        "🎓 Pons curves, then any Uniswap v2/v3/v4 pool\n"
-        "🧹 No spam: bursts merge into one post\n"
-        "🖼 Your own GIF in every post · no ads\n"
+        "🎓 The bonding curve, then the Uniswap v4 pool\n"
+        "💻 Dev buys and 🐋 whales marked\n"
+        "📈 A live trade card with every post\n"
+        "🧹 No spam · no ads\n"
         "\n"
         "Start: add me to your group, then send /track 0xTokenAddress\n"
         "\n"
-        "Not paper hands. Silver hands.\n"
-        "Not affiliated with Robinhood or Pons. Not financial advice."
+        "Testnet build of Silverhand Buys. Not paper hands. Silver hands.\n"
+        "Not affiliated with Robinhood or vibe/vibe. Not financial advice."
     ),
     "ru": (
         "⚡ Каждая покупка вашего токена — в вашем чате, как только она прошла в Robinhood Chain.\n"
@@ -39,8 +41,8 @@ DESCRIPTIONS = {
     ),
 }
 SHORT_DESCRIPTIONS = {
-    None: "Every buy of your token, live in your chat. Robinhood Chain. No ads. "
-          "Not affiliated with Robinhood or Pons.",
+    None: "Every vibe/vibe buy, live in your chat. Robinhood Chain testnet. "
+          "Not affiliated with Robinhood or vibe/vibe.",
     "ru": "Каждая покупка вашего токена — сразу в вашем чате. Robinhood Chain. Без рекламы. "
           "Не связан с Robinhood и Pons.",
 }
@@ -50,15 +52,18 @@ def utf16_len(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
 
-async def sync_profile(bot: Bot) -> list[str]:
+async def sync_profile(bot: Bot, langs=("en", "ru")) -> list[str]:
     """Set the texts Telegram does not have yet; returns what was changed.
-    Reading first keeps restarts from spending the rate limit on these calls."""
+    Reading first keeps restarts from spending the rate limit on these calls.
+    A language not in `langs` gets its texts removed (Telegram then shows the default)."""
     changed = []
     for lang, text in DESCRIPTIONS.items():
+        text = text if lang is None or lang in langs else ""
         if (await bot.get_my_description(language_code=lang)).description != text:
             await bot.set_my_description(description=text, language_code=lang)
             changed.append(f"description {lang or 'default'}")
     for lang, text in SHORT_DESCRIPTIONS.items():
+        text = text if lang is None or lang in langs else ""
         if (await bot.get_my_short_description(language_code=lang)).short_description != text:
             await bot.set_my_short_description(short_description=text, language_code=lang)
             changed.append(f"about {lang or 'default'}")

@@ -52,6 +52,21 @@ pool** (Ramses v3 too): the bot finds its pools itself and follows the deepest o
 with ETH, WETH, USDG and 35 Robinhood stock tokens (NVDA, TSLA, SPY…, priced by their
 Chainlink feeds on the chain).
 
+**v1.0 release candidate:** mainnet and testnet run as separate bot instances with
+separate databases. Features depend on the selected network:
+
+| Feature | Mainnet (4663) | Testnet (46630) |
+|---|---|---|
+| Pons / Flap launches | Supported | Not configured |
+| Supported DEX pools, buy/sell alerts, stats and scan | Supported | Available for configured contracts and quotes |
+| vibe/vibe V6 and curve launches | Not configured | Supported |
+| Daily digest and private drop alerts | Supported | Supported |
+| Mini App for settings and stats | Optional | Optional |
+| vibe/vibe promo videos and holder milestones | Unavailable | Supported |
+
+The testnet bot's dollar estimates use test assets and are approximate; they are
+not redeemable market values. Scan is informational and does not simulate selling.
+
 <br clear="right">
 
 ## Add it to your chat
@@ -140,9 +155,14 @@ flowchart LR
   batch. A scan is a one-off of about fifteen requests for a young token, kept for
   ten minutes and never part of the watcher's tick. Whether a token can be sold at
   all (a honeypot) is not checked: that needs a simulated sale, and the scan says so.
-- **Nothing lost, nothing doubled.** A tick's posts and its last block are
-  written in one transaction. After a long outage the bot skips ahead instead
-  of flooding chats with stale buys.
+- **Durable queue.** A tick's posts, milestone markers and last block are written
+  in one transaction. Temporary delivery failures are retried. An ambiguous
+  Telegram result or a restart after delivery but before acknowledgement can
+  produce a duplicate. After a long outage, the bot skips old blocks and drops
+  posts older than ten minutes instead of flooding chats with stale buys.
+- **Delivery under load.** Chats are processed by bounded workers. Only one heavy
+  render runs at a time; while it is occupied, other chats receive text posts.
+  Identical completed cards can be reused briefly across chats.
 - **Honest numbers.** A value the bot could not read is left out of the post,
   never shown as zero. Dollar values appear only for pairs it can price.
 
@@ -165,6 +185,15 @@ bash deploy/install.sh        # tests → live preflight → systemd service
 journalctl -u buybot -f
 ```
 
+For an upgrade from an older database, make and verify a backup first. The first
+start with this version requires `DB_CHAIN_ID=4663` (or `46630` for an existing
+testnet database) to confirm the original network of an unlabelled database.
+Once labelled, the database refuses a different network even if that setting changes.
+Use a different `DB_PATH` for each network. Rollback of code and data should use a
+matching backup; do not overwrite a live database from an older copy.
+
+The optional Mini App setup is in [docs/MINIAPP-SETUP.md](docs/MINIAPP-SETUP.md).
+
 `install.sh` refuses to start the bot unless the offline tests and the live
 preflight pass. The systemd unit caps the bot at 300 MB of RAM and 30% of a
 CPU, so it can share a small server.
@@ -180,6 +209,10 @@ CPU, so it can share a small server.
 | `SUPPORT_CONTACT` | — | shown by `/support` |
 | `SOURCE_URL` | — | link to your source, shown in `/terms` (see License) |
 | `RPC_URL` · `EXPLORER_URL` | public RPC · Blockscout | chain endpoints |
+| `CHAIN_ID` | `4663` (`46630` for the public testnet RPC if omitted) | expected network; startup checks the RPC before connecting to Telegram |
+| `DB_PATH` · `DB_CHAIN_ID` | `data/bot.db` · unset | database file; one-time original-network confirmation for legacy databases |
+| `WEBAPP_URL` · `WEBAPP_PORT` | disabled | HTTPS origin and loopback port, enabled together |
+| `LANGS` | `en,ru` | enabled languages |
 | `POLL_SECONDS` · `RPC_MIN_INTERVAL` | `3` · `0.3` | how often to poll, spacing between RPC calls |
 
 Owner commands in the private chat: `/admin` (the control panel: chats and health),
@@ -194,6 +227,7 @@ python3 tests.py                  # standard library only, no network
 pip install -r requirements.txt
 python3 tests_bot.py              # the Telegram layer against a fake Bot API, no network
 python3 tools/preflight.py        # live checks against Robinhood Chain
+python3 tools/check_public.py     # candidate public snapshot + both offline suites; no publication
 ```
 
 | Path | What lives there |
